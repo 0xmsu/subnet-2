@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import random
+from pathlib import Path
 
 from execution_layer.base_input import BaseInput
 from execution_layer.input_registry import InputRegistry
@@ -29,9 +31,12 @@ class CircuitInput(BaseInput):
 
     @staticmethod
     def generate() -> dict[str, object]:
-        return {
-            "input_data": [[random.uniform(-1.0, 1.0) for _ in range(INPUT_LENGTH)]]
-        }
+        # return {
+        #     "input_data": [[random.uniform(-1.0, 1.0) for _ in range(INPUT_LENGTH)]]
+        # }
+        input_file = Path(__file__).parent / "input.json"
+        with open(input_file, "r") as f:
+            return json.load(f)
 
     def validate(self, data: dict[str, object]) -> None:
         return CircuitInputSchema(**data)
