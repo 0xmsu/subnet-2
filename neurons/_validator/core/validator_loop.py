@@ -11,10 +11,11 @@ from queue import Empty
 from typing import NoReturn
 
 import bittensor as bt
+import cli_parser
 import httpx
 from bittensor.core.chain_data import AxonInfo
+from execution_layer.dsperse_manager import DSperseManager
 
-import cli_parser
 from _validator.api import ValidatorAPI
 from _validator.api.client import query_miner
 from _validator.competitions.competition import Competition
@@ -49,7 +50,6 @@ from constants import (
     ONE_HOUR,
     ONE_MINUTE,
 )
-from execution_layer.dsperse_manager import DSperseManager
 from utils import AutoUpdate, clean_temp_files, with_rate_limit
 from utils.gc_logging import gc_log_competition_metrics
 from utils.gc_logging import log_responses as gc_log_responses
@@ -487,7 +487,9 @@ class ValidatorLoop:
 
             if DEBUG_SYNC_MODE:
                 # Direct sync call for easier debugging
-                response = self.response_processor.verify_single_response(response)
+                response = self.response_processor.verify_single_response(
+                    request, response
+                )
             else:
                 # Run in thread pool to avoid blocking event loop
                 response: (
@@ -495,6 +497,7 @@ class ValidatorLoop:
                 ) = await asyncio.get_event_loop().run_in_executor(
                     self.response_thread_pool,
                     self.response_processor.verify_single_response,
+                    request,
                     response,
                 )
 
@@ -558,7 +561,9 @@ class ValidatorLoop:
             if response.verification_result:
                 bt.logging.info(
                     f"Successfully verified proof from UID {response.uid} "
-                    f"for circuit {response.circuit}. Request type: {response.request_type.name}"
+                    f"for circuit {response.circuit.metadata.name} ({response.circuit.metadata.version}), "
+                    f"using {response.proof_system}. "
+                    f"Request type: {response.request_type.name}"
                 )
             else:
                 response.response_time = (

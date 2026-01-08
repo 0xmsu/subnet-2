@@ -4,11 +4,9 @@ import tempfile
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
-import ezkl
 from bittensor import logging
 from deployment_layer.circuit_store import circuit_store
 from dsperse.src.compile.compiler import Compiler
@@ -16,7 +14,7 @@ from dsperse.src.prover import Prover
 from dsperse.src.run.runner import Runner
 from dsperse.src.verifier import Verifier
 from dsperse.src.slice.utils.converter import Converter
-from execution_layer.circuit import Circuit, CircuitType
+from execution_layer.circuit import Circuit, CircuitType, ProofSystem
 
 import cli_parser
 from _validator.models.dslice_request import DSliceQueuedProofRequest
@@ -30,36 +28,10 @@ class DSliceData:
     circuit_id: str
     input_file: Path
     output_file: Path
+    prove_system: ProofSystem | None = None
+    witness_file: Path | None = None
     proof_file: Path | None = None
     success: bool | None = None
-
-
-class EZKLInputType(Enum):
-    F16 = ezkl.PyInputType.F16
-    F32 = ezkl.PyInputType.F32
-    F64 = ezkl.PyInputType.F64
-    Int = ezkl.PyInputType.Int
-    Bool = ezkl.PyInputType.Bool
-    TDim = ezkl.PyInputType.TDim
-
-
-def ensure_proof_inputs(proof: dict, inputs: list[list], model_settings: dict) -> dict:
-    """
-    Ensures that the proof JSON contains the correct input instances.
-    That should prevent miners from cheating by reusing proofs with different inputs.
-    """
-    scale_map = model_settings.get("model_input_scales", [])
-    type_map = model_settings.get("input_types", [])
-    instances = [
-        ezkl.float_to_felt(x, scale_map[i], EZKLInputType[type_map[i]].value)
-        for i, arr in enumerate(inputs)
-        for x in arr
-    ]
-    proof["instances"] = [instances[:] + proof["instances"][0][len(instances) :]]
-
-    proof["transcript_type"] = "EVM"
-
-    return proof
 
 
 class DSperseManager:
@@ -102,11 +74,21 @@ class DSperseManager:
                         circuit=circuit,
                         inputs=json.load(input_file),
                         outputs=json.load(output_file),
+                        witness=(
+                            slice_data.witness_file.read_bytes()
+                            if slice_data.witness_file
+                            else None
+                        ),
                         slice_num=slice_data.slice_num,
                         run_uid=run_uid,
+                        proof_system=slice_data.prove_system,
                     )
 
-    def run_dsperse(self, circuit: Circuit, run_uid: str) -> list[DSliceData]:
+    def run_dsperse(
+        self,
+        circuit: Circuit,
+        run_uid: str,
+    ) -> list[DSliceData]:
         # Create temporary folder for run metadata
         run_metadata_path = Path(cli_parser.config.dsperse_run_dir) / f"run_{run_uid}"
         run_metadata_path.mkdir(parents=True, exist_ok=True)
@@ -121,9 +103,7 @@ class DSperseManager:
         # init runner and run the sliced model
         runner = Runner(save_metadata_path=save_metadata_path)
         results = runner.run(
-            input_json_path=input_json_path,
-            slice_path=circuit.paths.external_base_path,
-            backend="ezkl",
+            input_json_path=input_json_path, slice_path=circuit.paths.external_base_path
         )
         logging.debug(
             f"DSperse run completed. Results data saved at {save_metadata_path}"
@@ -141,13 +121,22 @@ class DSperseManager:
                 slice_num=slice_num.split("_")[-1],
                 input_file=Path(r["input_file"]),
                 output_file=Path(r["output_file"]),
+                witness_file=Path(r["witness_file"]) if r.get("witness_file") else None,
                 circuit_id=circuit.id,
+                prove_system=self._get_proof_system_for_run(r),
             )
             for slice_num, r in slice_results.items()
+            if not r["method"].startswith("onnx")
         ]
 
     def prove_slice(
-        self, circuit_id: str, slice_num: str, inputs: dict, outputs: dict
+        self,
+        circuit_id: str,
+        slice_num: str,
+        inputs: dict,
+        outputs: dict,
+        witness: bytes | None,
+        proof_system: ProofSystem,
     ) -> dict | None:
         """
         Generate proof for a given slice.
@@ -160,6 +149,7 @@ class DSperseManager:
 
             input_file = tmp_path / "input.json"
             output_file = tmp_path / "output.json"
+            witness_file = None
 
             with open(input_file, "w") as f:
                 json.dump(inputs, f)
@@ -167,12 +157,17 @@ class DSperseManager:
             with open(output_file, "w") as f:
                 json.dump(outputs, f)
 
+            if witness is not None:
+                witness_file = tmp_path / "output_witness.bin"
+                with open(witness_file, "wb") as f:
+                    f.write(witness)
+
             prover = Prover()
             result = prover.prove(
                 run_path=tmp_path,
                 model_dir=model_dir,
                 output_path=tmp_path,
-                backend="ezkl",
+                backend=proof_system.value.lower(),
             )
             logging.debug(f"Got proof generation result. Result: {result}")
 
@@ -182,8 +177,12 @@ class DSperseManager:
             proof_generation_time = proof_execution.get("proof_generation_time", None)
             proof_data = None
             if proof_execution.get("proof_file", None):
-                with open(proof_execution["proof_file"], "r") as proof_file:
-                    proof_data = json.load(proof_file)
+                if proof_system == ProofSystem.JSTPROVE:
+                    with open(proof_execution["proof_file"], "rb") as proof_file:
+                        proof_data = proof_file.read().hex()
+                else:
+                    with open(proof_execution["proof_file"], "r") as proof_file:
+                        proof_data = json.load(proof_file)
 
             return {
                 "circuit_id": circuit_id,
@@ -194,10 +193,7 @@ class DSperseManager:
             }
 
     def verify_slice_proof(
-        self,
-        run_uid: str,
-        slice_num: str,
-        proof: dict,
+        self, run_uid: str, slice_num: str, proof: dict | str, proof_system: ProofSystem
     ) -> bool:
         """
         Verify proof for a given slice.
@@ -212,22 +208,24 @@ class DSperseManager:
         )
         if slice_data is None:
             raise ValueError(f"Slice data for slice number {slice_num} not found.")
-
-        circuit = self._get_circuit_by_id(slice_data.circuit_id)
-        # prepare inputs
-        with open(slice_data.input_file, "r") as f:
-            input_obj = circuit.input_handler(
-                request_type=RequestType.DSLICE, data=json.load(f)
+        if slice_data.prove_system != proof_system:
+            raise ValueError(
+                f"Proof system mismatch for slice {slice_num} in run {run_uid}. Expected {slice_data.prove_system}, got {proof_system}."
             )
 
-        # ensure proof has correct inputs
-        proof = ensure_proof_inputs(
-            proof, input_obj.to_array(), self._get_slice_settings(circuit, slice_num)
-        )
+        circuit = self._get_circuit_by_id(slice_data.circuit_id)
 
         proof_file_path = slice_data.input_file.parent / "proof.json"
-        with open(proof_file_path, "w") as proof_file:
-            json.dump(proof, proof_file)
+        if proof_system == ProofSystem.JSTPROVE:
+            # for JSTPROVE, proof is a hex string of bytes
+            proof_bytes = bytes.fromhex(proof) if isinstance(proof, str) else proof
+            with open(proof_file_path, "wb") as proof_file:
+                proof_file.write(proof_bytes)
+        else:
+            # for other proof systems (now only EZKL), proof is a JSON object
+            with open(proof_file_path, "w") as proof_file:
+                json.dump(proof, proof_file)
+
         slice_data.proof_file = proof_file_path
 
         # time to verify!
@@ -235,7 +233,7 @@ class DSperseManager:
         result = verifier.verify(
             run_path=slice_data.input_file.parent,
             model_path=Path(circuit.paths.external_base_path) / f"slice_{slice_num}",
-            backend="ezkl",
+            backend=proof_system.value.lower() if proof_system else None,
         )
 
         logging.debug(f"Got proof verification result. Result: {result}")
@@ -281,37 +279,14 @@ class DSperseManager:
         for run_uid in list(self.runs.keys()):
             self.cleanup_run(run_uid)
 
-    def _get_slice_settings(self, circuit: Circuit, slice_num: str) -> dict:
-        """
-        Retrieve settings for a specific slice from its metadata.
-        """
-        metadata = self.get_slice_metadata(
-            Path(circuit.paths.external_base_path) / f"slice_{slice_num}"
-        )
-
-        settings_path = (
-            metadata.get("slices", [{}])[0]
-            .get("compilation", {})
-            .get("ezkl", {})
-            .get("files", {})
-            .get("settings", None)
-        )
-        if not settings_path:
-            raise ValueError(
-                f"Settings file path not found in metadata for slice {slice_num} of circuit {circuit.id}."
-            )
-        settings_path = (
-            Path(circuit.paths.external_base_path)
-            / f"slice_{slice_num}"
-            / settings_path
-        )
-        if not settings_path.exists() or not settings_path.is_file():
-            raise ValueError(
-                f"Settings file not found at {settings_path} for slice {slice_num} of circuit {circuit.id}."
-            )
-        with open(settings_path, "r") as f:
-            settings = json.load(f)
-        return settings
+    def _get_proof_system_for_run(self, result: dict) -> ProofSystem | None:
+        method = result.get("method", "")
+        if method.startswith("jstprove"):
+            return ProofSystem.JSTPROVE
+        elif method.startswith("ezkl"):
+            return ProofSystem.EZKL
+        else:
+            return None
 
     def _parse_dsperse_result(
         self, result: dict, execution_type: str
@@ -327,21 +302,6 @@ class DSperseManager:
         execution = execution_result.get(f"{execution_type}_execution", {})
 
         return slice_id, execution
-
-    @classmethod
-    def get_slice_metadata(cls, slice_path: Path | str) -> dict:
-        """
-        Retrieve metadata for a specific DSperse slice.
-        """
-        slice_path = Path(slice_path)
-        metadata_path = slice_path / "metadata.json"
-        if not metadata_path.exists():
-            raise ValueError(f"Metadata file not found at {metadata_path}.")
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-        if not isinstance(metadata, dict):
-            raise ValueError(f"Invalid metadata format at {metadata_path}.")
-        return metadata
 
     @classmethod
     def extract_dslices(cls, model_path: Path | str) -> None:
@@ -373,42 +333,3 @@ class DSperseManager:
             )
             # `cleanup=True` doesn't work for some reason, so we manually delete the .dslice file
             dslice_file.unlink(missing_ok=True)
-
-    @classmethod
-    def compile_dslices(cls, model_path: Path | str) -> None:
-        """
-        Compile DSperse slices in a folder if there are any.
-        XXX: Maybe we actually don't need that method anymore
-        """
-        model_path = Path(model_path)
-        logging.debug(
-            f"Checking compilation status for DSperse slices in {model_path.name}..."
-        )
-        compiler = Compiler()
-        compiler.compile(
-            model_path=model_path,
-            input_file=Path(__file__).parent.parent
-            / "deployment_layer"
-            / "model_b4a373270b59e2b9d5aac05e41df8cdff76a252f5543e00fcd87f2626b37361c"
-            / "input.json",
-        )
-        # for slice_dir in model_path.glob("slice_*"):
-        #     if not slice_dir.is_dir():
-        #         continue
-
-        #     metadata = cls.get_slice_metadata(slice_dir)
-        #     is_compiled = (
-        #         metadata.get("slices", [{}])[0]
-        #         .get("compilation", {})
-        #         .get("ezkl", {})
-        #         .get("compiled", False)
-        #     )
-        #     if is_compiled:
-        #         logging.debug(
-        #             f"DSlice {slice_dir.name} is already compiled. Skipping compilation."
-        #         )
-        #         continue
-
-        #     logging.info(
-        #         f"Compiling DSlice {slice_dir.name} in model {model_path.name}..."
-        #     )

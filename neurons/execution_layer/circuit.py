@@ -47,6 +47,7 @@ class ProofSystem(str, Enum):
     CIRCOM = "CIRCOM"
     JOLT = "JOLT"
     EZKL = "EZKL"
+    JSTPROVE = "JSTPROVE"
 
     def __str__(self):
         return self.value
@@ -147,9 +148,9 @@ class CircuitMetadata:
     description: str
     author: str
     version: str
-    proof_system: str
     type: CircuitType
     external_files: None | dict[str, str]
+    proof_system: str
     dslices: None | list[dict] = None
     netuid: int | None = None
     weights_version: int | None = None
