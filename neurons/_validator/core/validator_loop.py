@@ -132,6 +132,7 @@ class ValidatorLoop:
         self.processed_uids: set[int] = set()
         self.queryable_uids: list[int] = []
         self.last_response_time = time.time()
+        self.last_periodic_task_time = time.time()
 
         self._should_run = True
 
@@ -160,24 +161,58 @@ class ValidatorLoop:
             traceback.print_exc()
 
     @with_rate_limit(period=ONE_MINUTE)
-    def update_weights(self):
+    async def update_weights(self):
         start_time = time.time()
         try:
-            self.weights_manager.update_weights(self.score_manager.scores)
+            # Run blocking blockchain call in thread pool with timeout
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    self.weights_manager.update_weights,
+                    self.score_manager.scores,
+                ),
+                timeout=120.0,  # 2 minute timeout
+            )
             duration = time.time() - start_time
             log_weight_update(duration, success=True)
+        except asyncio.TimeoutError:
+            bt.logging.error("Weight update timed out after 120 seconds")
+            log_weight_update(120.0, success=False, failure_reason="timeout")
         except Exception as e:
             log_weight_update(0.0, success=False, failure_reason=str(e))
             log_error("weight_update", "weights_manager", str(e))
             raise
 
     @with_rate_limit(period=ONE_HOUR)
-    def sync_scores_uids(self):
-        self.score_manager.sync_scores_uids(self.config.metagraph.uids.tolist())
+    async def sync_scores_uids(self):
+        try:
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    self.score_manager.sync_scores_uids,
+                    self.config.metagraph.uids.tolist(),
+                ),
+                timeout=60.0,  # 1 minute timeout
+            )
+        except asyncio.TimeoutError:
+            bt.logging.error("sync_scores_uids timed out after 60 seconds")
+        except Exception as e:
+            bt.logging.error(f"Error in sync_scores_uids: {e}")
 
     @with_rate_limit(period=ONE_HOUR)
-    def sync_metagraph(self):
-        self.config.metagraph.sync(subtensor=self.config.subtensor)
+    async def sync_metagraph(self):
+        try:
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    lambda: self.config.metagraph.sync(subtensor=self.config.subtensor),
+                ),
+                timeout=120.0,  # 2 minute timeout
+            )
+        except asyncio.TimeoutError:
+            bt.logging.error("sync_metagraph timed out after 120 seconds")
+        except Exception as e:
+            bt.logging.error(f"Error in sync_metagraph: {e}")
 
     @with_rate_limit(period=ONE_HOUR)
     async def sync_capacities(self, miners_info: dict[int, AxonInfo]):
@@ -445,9 +480,9 @@ class ValidatorLoop:
             try:
 
                 self.check_auto_update()
-                self.sync_metagraph()
-                self.sync_scores_uids()
-                self.update_weights()
+                await self.sync_metagraph()
+                await self.sync_scores_uids()
+                await self.update_weights()
                 self.update_competition_metrics()
                 self.update_queryable_uids()
                 await self.sync_capacities(
@@ -461,11 +496,74 @@ class ValidatorLoop:
                 await self.log_responses()
                 if self.current_concurrency:
                     await self.sync_competition()
+                self.last_periodic_task_time = time.time()
                 await asyncio.sleep(LOOP_DELAY_SECONDS)
             except Exception as e:
                 bt.logging.error(f"Error in periodic tasks: {e}")
                 traceback.print_exc()
                 await asyncio.sleep(EXCEPTION_DELAY_SECONDS)
+
+    async def watchdog(self):
+        """
+        Monitor for validator freezes and log diagnostic information.
+
+        This coroutine periodically checks if the validator is making progress
+        and logs warnings if no activity is detected for extended periods.
+        """
+        WATCHDOG_INTERVAL = 60  # Check every minute
+        INACTIVITY_THRESHOLD = 300  # Warn after 5 minutes of no activity
+
+        while self._should_run:
+            try:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+
+                time_since_last_response = time.time() - self.last_response_time
+                time_since_last_periodic = time.time() - self.last_periodic_task_time
+                problem_detected = False
+
+                # Check for periodic tasks freeze (more critical - indicates blocking)
+                if time_since_last_periodic > INACTIVITY_THRESHOLD:
+                    bt.logging.error(
+                        f"WATCHDOG: Periodic tasks stalled for {time_since_last_periodic:.0f}s! "
+                        f"Possible blocking operation in progress."
+                    )
+                    problem_detected = True
+
+                # Check for response inactivity (less critical - could be network issues)
+                if time_since_last_response > INACTIVITY_THRESHOLD:
+                    bt.logging.warning(
+                        f"WATCHDOG: No miner responses for {time_since_last_response:.0f}s."
+                    )
+                    problem_detected = True
+
+                if problem_detected:
+                    # Log thread pool status to help diagnose
+                    try:
+                        thread_pool_queued = self.thread_pool._work_queue.qsize()
+                        response_pool_queued = (
+                            self.response_thread_pool._work_queue.qsize()
+                        )
+                        bt.logging.warning(
+                            f"WATCHDOG: Thread pools - main: {thread_pool_queued} queued, "
+                            f"response: {response_pool_queued} queued"
+                        )
+                    except Exception:
+                        pass  # Thread pool internals may not be accessible
+                    bt.logging.warning(
+                        f"Active tasks: {len(self.active_tasks)}/{MAX_CONCURRENT_REQUESTS}, "
+                        f"Queue size: {self.request_queue.qsize()}, "
+                        f"Queryable UIDs: {len(self.queryable_uids)}, "
+                        f"Current concurrency: {self.current_concurrency}"
+                    )
+                else:
+                    bt.logging.debug(
+                        f"WATCHDOG: Healthy - last response {time_since_last_response:.0f}s ago, "
+                        f"last periodic {time_since_last_periodic:.0f}s ago"
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                bt.logging.error(f"WATCHDOG error: {e}")
 
     async def run(self) -> NoReturn:
         """
@@ -479,6 +577,7 @@ class ValidatorLoop:
             await asyncio.gather(
                 self.maintain_request_pool(),
                 self.run_periodic_tasks(),
+                self.watchdog(),
             )
         except KeyboardInterrupt:
             self._should_run = False
