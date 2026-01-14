@@ -58,6 +58,8 @@ def run_shared_preflight_checks(role: Optional[Roles] = None):
             "Ensuring Node.js version": ensure_nodejs_version,
             "Checking SnarkJS installation": ensure_snarkjs_installed,
             "Checking EZKL installation": ensure_ezkl_installed,
+            "Checking MPI installation": ensure_mpi_installed,
+            "Checking JSTprove installation": ensure_jstprove_installed,
             "Syncing model files": partial(sync_models, role=role),
         }
     )
@@ -81,6 +83,68 @@ def run_shared_preflight_checks(role: Optional[Roles] = None):
             raise e
 
     bt.logging.info(" PreFlight | Pre-flight checks completed.")
+
+
+def ensure_mpi_installed():
+    """
+    Ensure MPI is installed (required by JSTprove).
+    """
+    try:
+        result = subprocess.run(
+            ["mpirun", "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        bt.logging.info(f"MPI is installed: {result.stdout.splitlines()[0]}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        import platform
+
+        if platform.system() == "Darwin":
+            bt.logging.warning("MPI not found. Installing via brew...")
+            subprocess.run(["brew", "install", "open-mpi"], check=True)
+        elif platform.system() == "Linux":
+            bt.logging.warning("MPI not found. Installing via apt...")
+            subprocess.run(["sudo", "apt", "update"], check=True)
+            subprocess.run(
+                ["sudo", "apt", "install", "-y", "libopenmpi-dev", "openmpi-bin"],
+                check=True,
+            )
+        else:
+            raise RuntimeError(
+                "MPI is required but not installed. Please install OpenMPI manually."
+            )
+        bt.logging.info("MPI installed successfully")
+
+
+def ensure_jstprove_installed():
+    """
+    Ensure JSTprove is installed via uv tool.
+    """
+    jst_path = os.path.join(os.path.expanduser("~"), ".local", "bin", "jst")
+    try:
+        if os.path.exists(jst_path):
+            result = subprocess.run(
+                [jst_path, "--version"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            bt.logging.info(f"JSTprove is installed: {result.stdout.strip()}")
+            return
+
+        bt.logging.warning("JSTprove not found. Installing via uv...")
+        subprocess.run(
+            ["uv", "tool", "install", "--python", "3.12", "JSTprove"],
+            check=True,
+        )
+        bt.logging.info("JSTprove installed successfully")
+
+    except subprocess.CalledProcessError as e:
+        bt.logging.error(f"Failed to install/verify JSTprove: {e}")
+        raise RuntimeError(
+            "JSTprove installation failed. Please install it manually with: uv tool install --python 3.12 JSTprove"
+        ) from e
 
 
 def ensure_ezkl_installed():
