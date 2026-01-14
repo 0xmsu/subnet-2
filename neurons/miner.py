@@ -9,10 +9,11 @@ import bittensor as bt
 
 from _miner.miner_session import MinerSession
 from constants import Roles
-from utils import run_shared_preflight_checks
+from utils import run_shared_preflight_checks, run_auto_update_check
 
 if __name__ == "__main__":
     cli_parser.init_config(Roles.MINER)
+    run_auto_update_check()
     run_shared_preflight_checks(Roles.MINER)
 
     try:

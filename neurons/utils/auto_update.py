@@ -14,6 +14,19 @@ import cli_parser
 TARGET_BRANCH = "main"
 
 
+def run_auto_update_check():
+    """
+    Run auto-update check before preflight to avoid crash loops from broken preflight code.
+    """
+    if cli_parser.config.no_auto_update:
+        return
+    try:
+        auto_updater = AutoUpdate()
+        auto_updater.try_update()
+    except Exception as e:
+        logging.warning(f"Auto-update check failed: {e}")
+
+
 class AutoUpdate:
     """
     Automatic update utility
