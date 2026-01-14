@@ -97,6 +97,7 @@ def ensure_mpi_installed():
             check=True,
         )
         bt.logging.info(f"MPI is installed: {result.stdout.splitlines()[0]}")
+        return
     except (subprocess.CalledProcessError, FileNotFoundError):
         import platform
 
@@ -122,26 +123,19 @@ def ensure_jstprove_installed():
     Ensure JSTprove is installed via uv tool.
     """
     jst_path = os.path.join(os.path.expanduser("~"), ".local", "bin", "jst")
-    try:
-        if os.path.exists(jst_path):
-            result = subprocess.run(
-                [jst_path, "--version"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            bt.logging.info(f"JSTprove is installed: {result.stdout.strip()}")
-            return
+    if os.path.exists(jst_path) and os.access(jst_path, os.X_OK):
+        bt.logging.info(f"JSTprove is installed at {jst_path}")
+        return
 
-        bt.logging.warning("JSTprove not found. Installing via uv...")
+    bt.logging.warning("JSTprove not found. Installing via uv...")
+    try:
         subprocess.run(
             ["uv", "tool", "install", "--python", "3.12", "JSTprove"],
             check=True,
         )
         bt.logging.info("JSTprove installed successfully")
-
     except subprocess.CalledProcessError as e:
-        bt.logging.error(f"Failed to install/verify JSTprove: {e}")
+        bt.logging.error(f"Failed to install JSTprove: {e}")
         raise RuntimeError(
             "JSTprove installation failed. Please install it manually with: uv tool install --python 3.12 JSTprove"
         ) from e
