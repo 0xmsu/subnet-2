@@ -28,7 +28,7 @@ class DSliceData:
     circuit_id: str
     input_file: Path
     output_file: Path
-    prove_system: ProofSystem | None = None
+    prove_system: ProofSystem
     witness_file: Path | None = None
     proof_file: Path | None = None
     success: bool | None = None
@@ -218,7 +218,14 @@ class DSperseManager:
         proof_file_path = slice_data.input_file.parent / "proof.json"
         if proof_system == ProofSystem.JSTPROVE:
             # for JSTPROVE, proof is a hex string of bytes
-            proof_bytes = bytes.fromhex(proof) if isinstance(proof, str) else proof
+            if not isinstance(proof, str):
+                logging.error(f"JSTPROVE proof must be a hex string, got {type(proof)}")
+                return False
+            try:
+                proof_bytes = bytes.fromhex(proof)
+            except ValueError as e:
+                logging.error(f"Invalid hex in JSTPROVE proof: {e}")
+                return False
             with open(proof_file_path, "wb") as proof_file:
                 proof_file.write(proof_bytes)
         else:
@@ -279,14 +286,13 @@ class DSperseManager:
         for run_uid in list(self.runs.keys()):
             self.cleanup_run(run_uid)
 
-    def _get_proof_system_for_run(self, result: dict) -> ProofSystem | None:
+    def _get_proof_system_for_run(self, result: dict) -> ProofSystem:
         method = result.get("method", "")
         if method.startswith("jstprove"):
             return ProofSystem.JSTPROVE
         elif method.startswith("ezkl"):
             return ProofSystem.EZKL
-        else:
-            return None
+        raise ValueError(f"Unknown proof method '{method}' - cannot determine proof system")
 
     def _parse_dsperse_result(
         self, result: dict, execution_type: str
