@@ -1,0 +1,28 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    # Her gün saat 06:00 UTC'de çalışır
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Manuel tetikleme için
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/inference-labs-inc/subnet-2.git || true
+          git fetch upstream
+
+      - name: Sync main branch
+        run: |
+          git checkout main
+          git merge upstream/main --no-edit --allow-unrelated-histories || true
+          git push origin main
