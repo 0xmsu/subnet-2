@@ -18,6 +18,8 @@ RUN apt update && \
     protobuf-compiler \
     ffmpeg \
     gosu \
+    libopenmpi-dev \
+    openmpi-bin \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
 # Make directories under opt and set owner to ubuntu
@@ -51,10 +53,11 @@ COPY --chown=ubuntu:ubuntu --chmod=775 uv.lock /opt/subnet-2/uv.lock
 RUN pipx install uv && \
     cd /opt/subnet-2 && \
     ~/.local/bin/uv sync --frozen --no-dev --compile-bytecode && \
+    ~/.local/bin/uv tool install --python 3.12 JSTprove && \
     ~/.local/bin/uv cache clean && \
     echo "source /opt/subnet-2/.venv/bin/activate" >> ~/.bashrc && \
     chmod -R 775 /opt/subnet-2/.venv
-ENV PATH="/opt/subnet-2/.venv/bin:${PATH}"
+ENV PATH="/opt/subnet-2/.venv/bin:/home/ubuntu/.local/bin:${PATH}"
 
 # Set workdir for running miner.py or validator.py and compile circuits
 WORKDIR /opt/subnet-2/neurons

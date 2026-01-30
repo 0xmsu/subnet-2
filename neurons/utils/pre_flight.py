@@ -66,10 +66,14 @@ def run_shared_preflight_checks(role: Optional[Roles] = None):
 
     bt.logging.info(" PreFlight | Running pre-flight checks")
 
-    # Skip sync_models during docker build
+    # Skip checks that require sudo or network during docker build
     if os.getenv("SUBNET_2_DOCKER_BUILD", False):
-        bt.logging.info(" PreFlight | Skipping model file sync")
+        bt.logging.info(" PreFlight | Skipping model file sync (docker build)")
         _ = preflight_checks.pop("Syncing model files")
+        bt.logging.info(" PreFlight | Skipping MPI installation check (docker build)")
+        _ = preflight_checks.pop("Checking MPI installation")
+        bt.logging.info(" PreFlight | Skipping JSTprove installation check (docker build)")
+        _ = preflight_checks.pop("Checking JSTprove installation")
 
     for check_name, check_function in preflight_checks.items():
         bt.logging.info(f" PreFlight | {check_name}")
