@@ -3,12 +3,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import os
-import random
 import sys
 import time
 import traceback
-from multiprocessing import Queue as MPQueue
-from queue import Empty
 from typing import NoReturn
 
 import bittensor as bt
@@ -20,7 +17,6 @@ from execution_layer.dsperse_manager import DSperseManager
 
 from _validator.api import ValidatorAPI
 from _validator.api.client import query_miner
-from _validator.competitions.competition import Competition
 from _validator.config import ValidatorConfig
 from _validator.core.capacity_manager import CapacityManager
 from _validator.core.exceptions import EmptyProofException, IncorrectProofException
@@ -36,8 +32,9 @@ from _validator.core.prometheus import (
 from _validator.core.request import Request
 from _validator.core.request_pipeline import RequestPipeline
 from _validator.core.response_processor import ResponseProcessor
+from _validator.models.dslice_request import DSliceQueuedProofRequest
 from _validator.models.miner_response import MinerResponse
-from _validator.models.request_type import RequestType, ValidatorMessage
+from _validator.models.request_type import RequestType
 from _validator.pow.proof_of_weights_handler import ProofOfWeightsHandler
 from _validator.scoring.score_manager import ScoreManager
 from _validator.scoring.weights import WeightsManager
@@ -55,11 +52,12 @@ from constants import (
     ONE_MINUTE,
 )
 from utils import AutoUpdate, clean_temp_files, with_rate_limit
-from utils.gc_logging import gc_log_competition_metrics
 from utils.gc_logging import log_responses as gc_log_responses
 
 # Set to True for synchronous request processing (easier debugging)
 DEBUG_SYNC_MODE = os.environ.get("DEBUG_SYNC_MODE", "").lower() in ("1", "true", "yes")
+
+MAX_SLICE_RETRIES = 3
 
 
 class ValidatorLoop:
@@ -74,44 +72,21 @@ class ValidatorLoop:
         Initialize the ValidatorLoop based on provided configuration.
 
         Args:
-            config (bt.config): Bittensor configuration object.
+            config (bt.Config): Bittensor configuration object.
         """
         self.config = config
         self.config.check_register()
         self.auto_update = AutoUpdate()
         self.httpx_client = httpx.AsyncClient()
 
-        self.validator_to_competition_queue = MPQueue()  # Messages TO competition
-        self.competition_to_validator_queue = MPQueue()  # Messages FROM competition
         self.current_concurrency = MAX_CONCURRENT_REQUESTS
         self.capacity_manager = CapacityManager(self.config, self.httpx_client)
         self.dsperse_manager = DSperseManager()
-        try:
-            competition_id = 1
-            bt.logging.info("Initializing competition module...")
-            self.competition = Competition(
-                competition_id,
-                self.config.metagraph,
-                self.config.wallet,
-                self.config.bt_config,
-            )
-            self.competition.set_validator_message_queues(
-                self.validator_to_competition_queue, self.competition_to_validator_queue
-            )
-            bt.logging.success("Competition module initialized successfully")
-            # self.clear_sota_state()
-        except Exception as e:
-            bt.logging.warning(
-                f"Failed to initialize competition, continuing without competition support: {e}"
-            )
-            traceback.print_exc()
-            self.competition = None
 
         self.score_manager = ScoreManager(
             self.config.metagraph,
             self.config.user_uid,
             self.config.full_path_score,
-            self.competition,
         )
         self.response_processor = ResponseProcessor(self.dsperse_manager)
         self.weights_manager = WeightsManager(
@@ -123,16 +98,20 @@ class ValidatorLoop:
         )
         self.last_pow_commit_block = 0
         self.api = ValidatorAPI(self.config)
+        self.api.dsperse_manager = self.dsperse_manager
         self.request_pipeline = RequestPipeline(
             self.config, self.score_manager, self.api
         )
 
         self.request_queue = asyncio.Queue()
-        self.active_tasks: dict[int, asyncio.Task] = {}
-        self.processed_uids: set[int] = set()
+        self.active_tasks: dict[str, asyncio.Task | None] = {}
+        self.miner_active_count: dict[int, int] = {}
+        self.miner_capacities: dict[int, int] = {}
+        self.default_miner_capacity = 10
         self.queryable_uids: list[int] = []
         self.last_response_time = time.time()
         self.last_periodic_task_time = time.time()
+        self._task_counter = 0
 
         self._should_run = True
 
@@ -140,25 +119,10 @@ class ValidatorLoop:
         self.response_thread_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=16
         )
-        self.last_competition_sync = 0
-        self.is_syncing_competition = False
-        self.competition_commitments = []
-
         self.recent_responses: list[MinerResponse] = []
 
         if self.config.bt_config.prometheus_monitoring:
             start_prometheus_logging(self.config.bt_config.prometheus_port)
-
-    def clear_sota_state(self):
-        try:
-            os.remove(
-                os.path.join(
-                    self.competition.competition_directory, "sota", "sota_state.json"
-                )
-            )
-        except Exception as e:
-            bt.logging.error(f"Error clearing sota state: {e}")
-            traceback.print_exc()
 
     @with_rate_limit(period=ONE_MINUTE)
     async def update_weights(self):
@@ -216,9 +180,23 @@ class ValidatorLoop:
 
     @with_rate_limit(period=ONE_HOUR)
     async def sync_capacities(self, miners_info: dict[int, AxonInfo]):
-        capacities = await self.capacity_manager.sync_capacities(miners_info)
-        bt.logging.debug(f"Synced capacities: {capacities}")
-        return capacities
+        capacities_by_uid = await self.capacity_manager.sync_capacities(miners_info)
+        bt.logging.debug(f"Synced capacities for {len(capacities_by_uid)} miners")
+
+        for uid in miners_info:
+            response = capacities_by_uid.get(uid)
+            if response and hasattr(response, "capacities") and response.capacities:
+                total_capacity = sum(response.capacities.values())
+                self.miner_capacities[uid] = (
+                    min(total_capacity, 20)
+                    if total_capacity > 0
+                    else self.default_miner_capacity
+                )
+            else:
+                self.miner_capacities[uid] = self.default_miner_capacity
+
+        bt.logging.info(f"Updated capacities for {len(self.miner_capacities)} miners")
+        return capacities_by_uid
 
     @with_rate_limit(period=FIVE_MINUTES)
     def check_auto_update(self):
@@ -233,7 +211,6 @@ class ValidatorLoop:
         bt.logging.info(
             f"In-flight requests: {len(self.active_tasks)} / {MAX_CONCURRENT_REQUESTS}"
         )
-        bt.logging.debug(f"Processed UIDs: {len(self.processed_uids)}")
         bt.logging.debug(f"Queryable UIDs: {len(self.queryable_uids)}")
 
         log_system_metrics()
@@ -244,84 +221,6 @@ class ValidatorLoop:
             else 0
         )
         log_queue_metrics(queue_size, est_latency)
-
-    def update_processed_uids(self):
-        if len(self.processed_uids) >= len(self.queryable_uids):
-            self.processed_uids.clear()
-
-    @with_rate_limit(period=ONE_HOUR)
-    async def sync_competition(self):
-        if not self.competition:
-            bt.logging.debug("Competition module not initialized, skipping sync")
-            return
-        if self.is_syncing_competition:
-            bt.logging.debug("Competition sync already in progress, skipping")
-            return
-        if not self.competition.is_active:
-            bt.logging.debug("Competition is not active, skipping sync")
-            return
-        try:
-            self.is_syncing_competition = True
-            bt.logging.info("Starting competition sync...")
-            bt.logging.debug("Fetching commitments...")
-            commitments = self.competition.fetch_commitments()
-            bt.logging.debug(f"Found {len(commitments)} commitments")
-            if commitments:
-                bt.logging.success(f"Found {len(commitments)} new circuits to evaluate")
-                for uid, hotkey, hash in commitments:
-                    if hash not in {
-                        state.hash for state in self.competition.miner_states.values()
-                    }:
-                        bt.logging.debug(
-                            f"Queueing download for circuit {hash[:8]}... from {hotkey[:8]}..."
-                        )
-                        self.competition.queue_download(uid, hotkey, hash)
-                bt.logging.debug(
-                    f"Queue size after adding: {len(self.competition.download_queue)}"
-                )
-            else:
-                bt.logging.debug("No new circuits found during sync")
-        except Exception as e:
-            bt.logging.error(f"Error in competition sync: {e}")
-            traceback.print_exc()
-        finally:
-            self.is_syncing_competition = False
-            bt.logging.debug("Competition sync complete")
-
-    @with_rate_limit(period=ONE_HOUR)
-    def update_competition_metrics(self):
-        bt.logging.debug("Updating competition metrics...")
-        if self.competition and getattr(self.competition, "is_active", False):
-            try:
-                metrics_to_log = self.competition.get_summary_for_logging()
-
-                if metrics_to_log and not cli_parser.config.disable_metric_logging:
-                    metrics_to_log["validator_key"] = (
-                        self.config.wallet.hotkey.ss58_address
-                    )
-
-                    bt.logging.debug("Logging competition metrics summary...")
-                    response = gc_log_competition_metrics(
-                        metrics_to_log, self.config.wallet.hotkey
-                    )
-
-                    if response and response.status_code == 200:
-                        bt.logging.success(
-                            "Successfully logged competition metrics summary."
-                        )
-                    else:
-                        status_code = response.status_code if response else "N/A"
-                        response_text = response.text if response else "N/A"
-                        bt.logging.error(
-                            "Failed to log competition metrics summary."
-                            f" Status: {status_code}, Response: {response_text}"
-                        )
-
-            except Exception as e:
-                bt.logging.error(
-                    f"Error during competition metric summary logging: {e}",
-                    exc_info=True,
-                )
 
     @with_rate_limit(period=ONE_MINUTE)
     async def log_responses(self):
@@ -357,38 +256,12 @@ class ValidatorLoop:
             self.last_response_time = time.time()
             self.recent_responses = []
 
-    async def maintain_competitions(self):
-        """
-        Maintain competition message handling.
-        """
-        try:
-            message = await asyncio.get_event_loop().run_in_executor(
-                self.thread_pool,
-                lambda: self.competition_to_validator_queue.get(timeout=0.1),
-            )
-            if message == ValidatorMessage.WINDDOWN:
-                bt.logging.info(
-                    "Received winddown message, reducing concurrency to zero"
-                )
-                self.current_concurrency = 0
-            elif message == ValidatorMessage.COMPETITION_COMPLETE:
-                bt.logging.info(
-                    "Received competition complete message, restoring concurrency"
-                )
-                self.current_concurrency = MAX_CONCURRENT_REQUESTS
-        except Empty:
-            bt.logging.trace("No messages in competition queue")
-        except Exception as e:
-            bt.logging.error(f"Error in competition message handling: {e}")
-            traceback.print_exc()
-
     async def maintain_request_pool(self):
         """
         Maintain the pool of active requests to miners.
-        Basically, the main loop of the validator.
+        Supports multiple concurrent requests per miner based on their capacity.
         """
         while self._should_run:
-            await self.maintain_competitions()
             try:
                 slots_available = self.current_concurrency - len(self.active_tasks)
 
@@ -397,60 +270,87 @@ class ValidatorLoop:
                     continue
 
                 if not self.api.stacked_requests_queue:
-                    # Refill the stacked requests queue from DSperse manager if needed
                     for (
                         dslice_request
                     ) in self.dsperse_manager.generate_dslice_requests():
                         self.api.stacked_requests_queue.insert(0, dslice_request)
 
-                # available miners to send requests to
-                available_uids = [
-                    uid
-                    for uid in self.queryable_uids
-                    if uid not in self.processed_uids and uid not in self.active_tasks
-                ]
-                random.shuffle(available_uids)
+                pow_circuit = None
+                if (
+                    len(self.score_manager.pow_manager.proof_of_weights_queue)
+                    >= ProofOfWeightsHandler.BATCH_SIZE
+                ):
+                    loop = asyncio.get_event_loop()
+                    pow_circuit = await loop.run_in_executor(
+                        self.thread_pool,
+                        circuit_store.ensure_circuit,
+                        BATCHED_PROOF_OF_WEIGHTS_MODEL_ID,
+                    )
 
-                for uid in available_uids[:slots_available]:
-                    if (
-                        len(self.score_manager.pow_manager.proof_of_weights_queue)
-                        >= ProofOfWeightsHandler.BATCH_SIZE
-                    ):
-                        # too many PoW items queued, send a batched PoW request to clear them
-                        request = self.request_pipeline._prepare_benchmark_request(
-                            uid,
-                            circuit_store.get_circuit(
-                                BATCHED_PROOF_OF_WEIGHTS_MODEL_ID
-                            ),
-                        )
-                    elif self.api.stacked_requests_queue:
-                        request = self.request_pipeline._prepare_queued_request(uid)
-                    else:
-                        request = self.request_pipeline._prepare_benchmark_request(uid)
+                requests_sent = 0
+                for uid in self.queryable_uids:
+                    if requests_sent >= slots_available:
+                        break
 
-                    if not request:
-                        bt.logging.warning(
-                            f"Empty request prepared for UID {uid}, skipping"
-                        )
+                    miner_capacity = self.miner_capacities.get(
+                        uid, self.default_miner_capacity
+                    )
+                    miner_active = self.miner_active_count.get(uid, 0)
+                    available_slots = miner_capacity - miner_active
+
+                    if available_slots <= 0:
                         continue
 
-                    if DEBUG_SYNC_MODE:
-                        # Synchronous mode for easier debugging -- NOT FOR PRODUCTION
-                        bt.logging.debug(
-                            f"[SYNC MODE] Processing request for UID {uid}"
-                        )
-                        self.active_tasks[uid] = "dummy_task_object"  # type: ignore
-                        await self._process_single_request(request)
-                        self._handle_completed_task(uid)
-                    else:
-                        # Asynchronous mode for normal operation
-                        task = asyncio.create_task(
-                            self._process_single_request(request)
-                        )
-                        self.active_tasks[uid] = task
-                        task.add_done_callback(
-                            lambda _, uid=uid: self._handle_completed_task(uid)
-                        )
+                    requests_for_miner = min(
+                        available_slots, slots_available - requests_sent
+                    )
+
+                    for _ in range(requests_for_miner):
+                        if pow_circuit is not None:
+                            request = self.request_pipeline._prepare_benchmark_request(
+                                uid,
+                                pow_circuit,
+                            )
+                        elif self.api.stacked_requests_queue:
+                            request = self.request_pipeline._prepare_queued_request(uid)
+                        else:
+                            request = self.request_pipeline._prepare_benchmark_request(
+                                uid
+                            )
+
+                        if not request:
+                            bt.logging.warning(
+                                f"Empty request prepared for UID {uid}, skipping"
+                            )
+                            break
+
+                        task_id = self._generate_task_id(uid)
+
+                        if DEBUG_SYNC_MODE:
+                            bt.logging.debug(
+                                f"[SYNC MODE] Processing request {task_id} for UID {uid}"
+                            )
+                            self.active_tasks[task_id] = None
+                            self.miner_active_count[uid] = (
+                                self.miner_active_count.get(uid, 0) + 1
+                            )
+                            await self._process_single_request(request)
+                            self._handle_completed_task(task_id, uid)
+                        else:
+                            task = asyncio.create_task(
+                                self._process_single_request(request)
+                            )
+                            self.active_tasks[task_id] = task
+                            self.miner_active_count[uid] = (
+                                self.miner_active_count.get(uid, 0) + 1
+                            )
+                            task.add_done_callback(
+                                lambda _, tid=task_id, u=uid: self._handle_completed_task(
+                                    tid, u
+                                )
+                            )
+
+                        requests_sent += 1
 
                 await asyncio.sleep(0)
             except Exception as e:
@@ -458,22 +358,17 @@ class ValidatorLoop:
                 traceback.print_exc()
                 await asyncio.sleep(EXCEPTION_DELAY_SECONDS)
 
-    def _handle_completed_task(self, uid: int):
-        self.processed_uids.add(uid)
+    def _generate_task_id(self, uid: int) -> str:
+        """Generate a unique task ID for tracking."""
+        self._task_counter += 1
+        return f"{uid}_{self._task_counter}_{time.time()}"
 
-        if uid in self.active_tasks:
-            del self.active_tasks[uid]
-            if (
-                self.current_concurrency == 0
-                and not self.active_tasks
-                and self.competition
-            ):
-                bt.logging.info(
-                    "All tasks completed during winddown, sending winddown complete message"
-                )
-                self.validator_to_competition_queue.put(
-                    ValidatorMessage.WINDDOWN_COMPLETE
-                )
+    def _handle_completed_task(self, task_id: str, uid: int):
+        if task_id in self.active_tasks:
+            del self.active_tasks[task_id]
+
+        if uid in self.miner_active_count:
+            self.miner_active_count[uid] = max(0, self.miner_active_count[uid] - 1)
 
     async def run_periodic_tasks(self):
         while self._should_run:
@@ -483,7 +378,6 @@ class ValidatorLoop:
                 await self.sync_metagraph()
                 await self.sync_scores_uids()
                 await self.update_weights()
-                self.update_competition_metrics()
                 self.update_queryable_uids()
                 await self.sync_capacities(
                     {
@@ -491,11 +385,8 @@ class ValidatorLoop:
                         for uid in self.queryable_uids
                     }
                 )
-                self.update_processed_uids()
                 self.log_health()
                 await self.log_responses()
-                if self.current_concurrency:
-                    await self.sync_competition()
                 self.last_periodic_task_time = time.time()
                 await asyncio.sleep(LOOP_DELAY_SECONDS)
             except Exception as e:
@@ -641,7 +532,7 @@ class ValidatorLoop:
     def _reschedule_request(self, request: Request) -> None:
         """
         Reschedule a failed request for retry.
-        Only RWR and DSLICE requests are rescheduled.
+        Only RWR and DSLICE requests are rescheduled, up to MAX_SLICE_RETRIES times.
         """
         if request.request_type not in (RequestType.RWR, RequestType.DSLICE):
             bt.logging.debug(
@@ -655,14 +546,46 @@ class ValidatorLoop:
             )
             return
 
+        queued = request.queued_request
+        queued.retry_count += 1
+
+        if queued.retry_count > MAX_SLICE_RETRIES:
+            bt.logging.warning(
+                f"{request.request_type.name} request exceeded max retries "
+                f"({MAX_SLICE_RETRIES}) for UID {request.uid}"
+            )
+            self.request_pipeline.hash_guard.remove_hash(request.guard_hash)
+            if request.request_type == RequestType.DSLICE:
+                self._mark_dslice_failed(queued)
+            elif request.request_type == RequestType.RWR:
+                self.api.set_request_result(
+                    request.external_request_hash,
+                    {"success": False, "error": "Max retries exceeded"},
+                )
+            return
+
         bt.logging.info(
-            f"Rescheduling {request.request_type.name} request for UID {request.uid}..."
+            f"Rescheduling {request.request_type.name} request for UID {request.uid} "
+            f"(attempt {queued.retry_count}/{MAX_SLICE_RETRIES})..."
         )
 
-        # Remove hash from HashGuard to allow retry
         self.request_pipeline.hash_guard.remove_hash(request.guard_hash)
-        # Re-add to the stacked requests queue for retry with a different miner
-        self.api.stacked_requests_queue.append(request.queued_request)
+        self.api.stacked_requests_queue.append(queued)
+
+    def _mark_dslice_failed(self, queued: DSliceQueuedProofRequest) -> None:
+        self.dsperse_manager.on_slice_result(
+            queued.run_uid, queued.slice_num, success=False
+        )
+
+    def _mark_dslice_complete(self, response: MinerResponse) -> None:
+        run_uid = response.dsperse_run_uid
+        slice_num = response.dsperse_slice_num
+        if not run_uid or slice_num is None:
+            bt.logging.warning(
+                f"Cannot mark DSLICE complete: missing run_uid={run_uid} or slice_num={slice_num}"
+            )
+            return
+        self.dsperse_manager.on_slice_result(run_uid, str(slice_num), success=True)
 
     async def _handle_response(self, response: MinerResponse) -> None:
         """
@@ -704,6 +627,11 @@ class ValidatorLoop:
                             "success": False,
                         },
                     )
+            elif (
+                response.request_type == RequestType.DSLICE
+                and response.verification_result
+            ):
+                self._mark_dslice_complete(response)
 
             if response.verification_result and response.save:
                 save_proof_of_weights(
@@ -744,8 +672,4 @@ class ValidatorLoop:
         stop_prometheus_logging()
         clean_temp_files()
         self.dsperse_manager.total_cleanup()
-        if self.competition:
-            self.competition.competition_thread.stop()
-            if hasattr(self.competition.circuit_manager, "close"):
-                await self.competition.circuit_manager.close()
         sys.exit(0)

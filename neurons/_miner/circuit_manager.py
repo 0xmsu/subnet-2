@@ -1,17 +1,20 @@
 from __future__ import annotations
-import time
+
 import hashlib
-import boto3
-import traceback
 import threading
-from typing import Optional, Dict
-from substrateinterface import Keypair
+import time
+import traceback
 from pathlib import Path
-from botocore.config import Config
+from typing import Dict, Optional
+
 import bittensor as bt
-from constants import ACTIVE_COMPETITION
+import boto3
+from botocore.config import Config
 from pydantic import BaseModel
+from substrateinterface import Keypair
+
 import cli_parser
+from constants import ACTIVE_COMPETITION
 
 
 class CircuitCommitment(BaseModel):
@@ -85,7 +88,7 @@ class CircuitManager:
         self.storage_config = storage_config
         self.bucket = storage_config["bucket"]
 
-        self.subtensor = bt.subtensor(config=cli_parser.config)
+        self.subtensor = bt.Subtensor(config=cli_parser.config)
         bt.logging.debug(
             "Created dedicated subtensor instance for circuit manager using cli config"
         )

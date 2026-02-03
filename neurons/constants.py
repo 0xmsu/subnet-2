@@ -43,7 +43,7 @@ CIRCUIT_TIMEOUT_SECONDS = 60
 # An additional queueing time for external requests
 EXTERNAL_REQUEST_QUEUE_TIME_SECONDS = 10
 # Maximum number of concurrent requests that the validator will handle
-MAX_CONCURRENT_REQUESTS = 16
+MAX_CONCURRENT_REQUESTS = 128
 # Default proof size when we're unable to determine the actual size
 DEFAULT_PROOF_SIZE = 5000
 # Size in percent of the sample to be used for the maximum score median
@@ -174,3 +174,12 @@ MAX_CIRCUIT_SIZE_GB = 50
 EMA_BOOST_FACTOR = 1.2
 # EMA enabled flag
 EMA_ENABLED = False
+
+CIRCUIT_API_URL = os.getenv("CIRCUIT_API_URL", "https://repository.inferencelabs.com")
+CIRCUIT_R2_BASE_URL = os.getenv(
+    "CIRCUIT_R2_BASE_URL", "https://dsperse.inferencelabs.com"
+)
+CIRCUIT_CACHE_DIR = os.path.join(
+    os.path.expanduser("~"), ".bittensor", "subnet-2", "circuit_cache"
+)
+CIRCUIT_METADATA_FILENAME = "circuit_metadata.json"

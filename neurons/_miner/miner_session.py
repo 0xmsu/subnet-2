@@ -26,7 +26,6 @@ from rich.table import Table
 
 from _validator.models.request_type import RequestType
 from constants import (
-    CIRCUIT_TIMEOUT_SECONDS,
     ONE_HOUR,
     SINGLE_PROOF_OF_WEIGHTS_MODEL_ID,
 )
@@ -153,16 +152,12 @@ class MinerSession:
                     table = Table(title=f"Miner Status (UID: {self.subnet_uid})")
                     table.add_column("Block", justify="center", style="cyan")
                     table.add_column("Stake", justify="center", style="cyan")
-                    table.add_column("Rank", justify="center", style="cyan")
-                    table.add_column("Trust", justify="center", style="cyan")
                     table.add_column("Consensus", justify="center", style="cyan")
                     table.add_column("Incentive", justify="center", style="cyan")
                     table.add_column("Emission", justify="center", style="cyan")
                     table.add_row(
                         str(self.metagraph.block.item()),
                         str(self.metagraph.S[self.subnet_uid]),
-                        str(self.metagraph.R[self.subnet_uid]),
-                        str(self.metagraph.T[self.subnet_uid]),
                         str(self.metagraph.C[self.subnet_uid]),
                         str(self.metagraph.I[self.subnet_uid]),
                         str(self.metagraph.E[self.subnet_uid]),
@@ -197,8 +192,8 @@ class MinerSession:
             self.subnet_uid = subnet_uid
 
     def configure(self):
-        self.wallet = bt.wallet(config=cli_parser.config)
-        self.subtensor = bt.subtensor(config=cli_parser.config)
+        self.wallet = bt.Wallet(config=cli_parser.config)
+        self.subtensor = bt.Subtensor(config=cli_parser.config)
         self.metagraph = self.subtensor.metagraph(cli_parser.config.netuid)
         self.server = MinerServer(
             wallet=self.wallet, config=cli_parser.config, metagraph=self.metagraph
@@ -377,12 +372,6 @@ class MinerSession:
         """
         This function run proof generation of the model (with its output as well)
         """
-        if cli_parser.config.competition_only:
-            bt.logging.info("Competition only mode enabled. Skipping proof generation.")
-            return JSONResponse(
-                content="Competition only mode enabled", status_code=422
-            )
-
         time_in = time.time()
         bt.logging.debug("Received request from validator")
         bt.logging.debug(f"Input data: {data.query_input} \n")
@@ -392,15 +381,28 @@ class MinerSession:
             return JSONResponse(content="Empty query input", status_code=422)
 
         model_id = str(data.model_id or SINGLE_PROOF_OF_WEIGHTS_MODEL_ID)
-        circuit_timeout = CIRCUIT_TIMEOUT_SECONDS
-        try:
-            circuit = circuit_store.get_circuit(model_id)
-            if not circuit:
-                return JSONResponse(
-                    content=f"'{model_id}' Circuit not found", status_code=422
-                )
 
-            circuit_timeout = circuit.timeout
+        try:
+            circuit = circuit_store.ensure_circuit(model_id)
+        except (ValueError, KeyError) as e:
+            bt.logging.warning(f"Invalid circuit ID {model_id}: {e}")
+            return JSONResponse(
+                content=f"Invalid circuit ID: {model_id}", status_code=422
+            )
+        except Exception as e:
+            bt.logging.error(f"Server error loading circuit {model_id}: {e}")
+            traceback.print_exc()
+            return JSONResponse(content="Internal server error", status_code=500)
+
+        if not circuit:
+            bt.logging.warning(f"Circuit not found: {model_id}")
+            return JSONResponse(
+                content=f"Circuit not found: {model_id}", status_code=404
+            )
+
+        circuit_timeout = circuit.timeout
+
+        try:
             bt.logging.info(f"Running proof generation for {circuit}")
             model_session = VerifiedModelSession(
                 GenericInput(RequestType.RWR, data.query_input), circuit
@@ -452,12 +454,6 @@ class MinerSession:
         """
         Handles a proof of weights request
         """
-        if cli_parser.config.competition_only:
-            bt.logging.info("Competition only mode enabled. Skipping proof generation.")
-            return JSONResponse(
-                content="Competition only mode enabled", status_code=422
-            )
-
         time_in = time.time()
         bt.logging.debug("Received proof of weights request from validator")
         bt.logging.debug(f"Input data: {data.inputs} \n")
@@ -467,13 +463,22 @@ class MinerSession:
             return JSONResponse(
                 content="Empty input for proof of weights", status_code=422
             )
-        circuit_timeout = CIRCUIT_TIMEOUT_SECONDS
         response = {}
+        model_id = str(data.verification_key_hash)
         try:
-            circuit = circuit_store.get_circuit(str(data.verification_key_hash))
-            if not circuit:
-                return JSONResponse(content="Circuit not found", status_code=422)
-            circuit_timeout = circuit.timeout
+            circuit = circuit_store.ensure_circuit(model_id)
+        except (ValueError, KeyError) as e:
+            bt.logging.warning(f"Invalid circuit ID {model_id}: {e}")
+            return JSONResponse(
+                content=f"Invalid circuit ID: {model_id}", status_code=422
+            )
+        except Exception as e:
+            bt.logging.error(f"Server error loading circuit {model_id}: {e}")
+            traceback.print_exc()
+            return JSONResponse(content="Internal server error", status_code=500)
+
+        circuit_timeout = circuit.timeout
+        try:
             bt.logging.info(f"Running proof generation for {circuit}")
             model_session = VerifiedModelSession(
                 GenericInput(RequestType.RWR, data.inputs), circuit

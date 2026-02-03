@@ -26,7 +26,7 @@ elif "-h" in sys.argv:
 import bittensor as bt
 
 parser: Optional[argparse.ArgumentParser]
-config: Optional[bt.config]
+config: Optional[bt.Config]
 
 
 DESCRIPTION = {
@@ -107,6 +107,12 @@ def init_config(role: Optional[str] = None):
         default=None,
         help="Custom location for storing dsperse run data (optional)",
     )
+    parser.add_argument(
+        "--download-all-circuits",
+        default=False,
+        action="store_true",
+        help="Download all circuits from API during startup (default: False)",
+    )
     if role == Roles.VALIDATOR:
         # CLI arguments specific to the validator
         _validator_config()
@@ -114,10 +120,10 @@ def init_config(role: Optional[str] = None):
         # CLI arguments specific to the miner
         _miner_config()
     else:
-        bt.subtensor.add_args(parser)
+        bt.Subtensor.add_args(parser)
         bt.logging.add_args(parser)
-        bt.wallet.add_args(parser)
-        config = bt.config(parser, strict=True)
+        bt.Wallet.add_args(parser)
+        config = bt.Config(parser, strict=True)
 
     if SHOW_HELP:
         # --help or -h flag was passed, show the help message and exit
@@ -235,25 +241,19 @@ def _miner_config():
         default=os.getenv("STORAGE_REGION", "us-east-1"),
     )
 
-    parser.add_argument(
-        "--competition-only",
-        action="store_true",
-        help="Whether to only run the competition. Disables regular mining when set.",
-    )
-
-    bt.subtensor.add_args(parser)
+    bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
-    bt.wallet.add_args(parser)
-    bt.axon.add_args(parser)
+    bt.Wallet.add_args(parser)
+    bt.Axon.add_args(parser)
 
-    config = bt.config(parser, strict=True)
+    config = bt.Config(parser, strict=True)
 
     if config.localnet:
         # quick localnet configuration set up for testing (specific params for miner)
         if config.wallet.name == "default":
             config.wallet.name = "miner"
         if not config.axon:
-            config.axon = bt.config()
+            config.axon = bt.Config()
             config.axon.ip = "127.0.0.1"
             config.axon.external_ip = "127.0.0.1"
         config.disable_blacklist = (
@@ -380,11 +380,11 @@ def _validator_config():
         help="The port for the prometheus monitoring.",
     )
 
-    bt.subtensor.add_args(parser)
+    bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
-    bt.wallet.add_args(parser)
+    bt.Wallet.add_args(parser)
 
-    config = bt.config(parser, strict=True)
+    config = bt.Config(parser, strict=True)
 
     if config.localnet:
         # quick localnet configuration set up for testing (specific params for validator)

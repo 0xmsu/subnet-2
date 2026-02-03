@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools >= 61.0"]
+requires = ["setuptools >= 78.1.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,25 +7,22 @@ name = "subnet-2"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
-requires-python = "==3.12.*"
+requires-python = ">=3.13,<3.14"
 dependencies = [
-  "aiohttp>=3.10.11",
+  "aiohttp>=3.13.3",
   "async-substrate-interface>=1.0.8",
   "attrs==24.3.0",
-  "bittensor==9.9.0",
+  "bittensor==10.0.1",
   "boto3>=1.36.13",
   "botocore>=1.37.19",
-  "dsperse",
-  "ezkl==22.2.1",
-  "fastapi==0.110.3",
+  "dsperse==3.0.0",
+  "jstprove==2.3.1",
+  "fastapi>=0.115.6",
   "gitpython>=3.1.44",
   "httpx>=0.28.1",
   "jsonrpcserver>=5.0.9",
   "matplotlib>=3.10.1",
   "numpy~=2.2.3",
-  "onnxruntime>=1.21.0",
-  "opencv-contrib-python-headless>=4.11.0.86",
-  "opencv-python>=4.11.0.86",
   "packaging==24.2",
   "pillow>=11.3.0",
   "prometheus_client==0.21.1",
@@ -39,7 +36,7 @@ dependencies = [
   "substrate-interface>=1.7.11",
   "torch==2.7.1",
   "tqdm>=4.67.1",
-  "urllib3>=2.3.0",
+  "urllib3>=2.6.3",
   "uvicorn==0.34.0",
   "wandb==0.21.0",
   "websocket-client>=1.8.0",
@@ -53,6 +50,7 @@ dev = [
   "ipykernel>=6.29.5",
   "nbdev>=2.3.34",
   "onnx>=1.17.0",
+  "pre-commit>=4.5.1",
   "pytest>=8.4.1",
   "snoop>=0.6.0",
   "tach>=0.27.2",
@@ -73,9 +71,17 @@ python_functions = ["test_*"]
 addopts = "-v --tb=short"
 pythonpath = [".", "neurons"]
 
+[tool.uv]
+override-dependencies = [
+  "setuptools>=78.1.1",
+  "wheel>=0.46.2",
+  "torch==2.7.1",
+  "requests==2.32.4",
+  "psutil==6.1.1",
+]
+
 [tool.uv.sources]
 torch = { index = "pytorch" }
-dsperse = { git = "https://github.com/inference-labs-inc/dsperse.git", rev = "4d6bf9685e1bc02dc21df1e78ba8c07d735ae72c" }
 
 [[tool.uv.index]]
 name = "pytorch"
