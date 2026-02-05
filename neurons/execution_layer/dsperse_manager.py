@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import random
@@ -6,7 +7,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from bittensor import logging
 from deployment_layer.circuit_store import circuit_store
@@ -19,11 +20,32 @@ from dsperse.src.run.runner import Runner
 from dsperse.src.verify.verifier import Verifier
 from dsperse.src.slice.utils.converter import Converter
 from execution_layer.circuit import Circuit, CircuitType, ProofSystem
+from utils.system import capture_environment
 
 import cli_parser
 from _validator.models.dslice_request import DSliceQueuedProofRequest
 from _validator.models.request_type import RequestType
 from utils.pre_flight import SYNC_LOG_PREFIX
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from execution_layer.dsperse_event_client import DsperseEventClient
+
+
+@dataclass
+class SliceTimingData:
+    slice_num: str
+    proof_system: Optional[str] = None
+    backend_used: Optional[str] = None
+    witness_time_sec: float = 0.0
+    response_time_sec: float = 0.0
+    verification_time_sec: float = 0.0
+    is_tiled: bool = False
+    tile_count: Optional[int] = None
+    memory_peak_mb: float = 0.0
+    success: bool = False
+    error: Optional[str] = None
 
 
 @dataclass
@@ -36,6 +58,7 @@ class DSliceData:
     witness_file: Path | None = None
     proof_file: Path | None = None
     success: bool | None = None
+    timing: SliceTimingData | None = None
 
 
 @dataclass
@@ -48,6 +71,9 @@ class DsperseRun:
     completed: set[str] = field(default_factory=set)
     failed: set[str] = field(default_factory=set)
     callback: Callable[["DsperseRun"], None] | None = None
+    environment: dict = field(default_factory=dict)
+    start_time: float = 0.0
+    circuit_name: str = ""
 
     @property
     def is_complete(self) -> bool:
@@ -59,13 +85,14 @@ class DsperseRun:
 
 
 class DSperseManager:
-    def __init__(self):
+    def __init__(self, event_client: "DsperseEventClient | None" = None):
         self.circuits: list[Circuit] = [
             circuit
             for circuit in circuit_store.circuits.values()
             if circuit.metadata.type == CircuitType.DSPERSE_PROOF_GENERATION
         ]
         self.runs: dict[str, DsperseRun] = {}
+        self.event_client = event_client
         self._purge_old_runs()
 
     @staticmethod
@@ -86,6 +113,13 @@ class DSperseManager:
             except Exception as e:
                 logging.warning(f"Failed to remove {entry}: {e}")
 
+    def _schedule_async(self, coro):
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(coro)
+        except RuntimeError:
+            coro.close()
+
     def _get_circuit_by_id(self, circuit_id: str) -> Circuit:
         circuit = next((c for c in self.circuits if c.id == circuit_id), None)
         if circuit is None:
@@ -104,9 +138,12 @@ class DSperseManager:
         callback: Callable[[DsperseRun], None] | None = None,
     ) -> tuple[str, list[DSliceQueuedProofRequest]]:
         run_uid = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        start_time = time.perf_counter()
         logging.info(
             f"Starting DSperse run for circuit {circuit.metadata.name}. Run UID: {run_uid}"
         )
+
+        environment = capture_environment()
 
         run_dir = Path(tempfile.mkdtemp(prefix=f"dsperse_run_{run_uid}_"))
 
@@ -146,6 +183,9 @@ class DSperseManager:
             slices={s.slice_num: s for s in slice_data_list},
             pending={s.slice_num for s in slice_data_list},
             callback=callback,
+            environment=environment,
+            start_time=start_time,
+            circuit_name=circuit.metadata.name,
         )
         self.runs[run_uid] = dsperse_run
 
@@ -168,6 +208,28 @@ class DSperseManager:
             )
 
         logging.info(f"Generated {len(requests)} DSlice requests for run {run_uid}")
+
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_run_started(
+                    run_uid=run_uid,
+                    circuit_id=circuit.id,
+                    circuit_name=circuit.metadata.name,
+                    total_slices=len(slice_data_list),
+                    environment=environment,
+                )
+            )
+            for slice_data in slice_data_list:
+                if slice_data.timing:
+                    self._schedule_async(
+                        self.event_client.emit_witness_complete(
+                            run_uid=run_uid,
+                            slice_num=slice_data.slice_num,
+                            witness_time_sec=slice_data.timing.witness_time_sec,
+                            memory_peak_mb=slice_data.timing.memory_peak_mb,
+                        )
+                    )
+
         return run_uid, requests
 
     def generate_dslice_requests(self) -> list[DSliceQueuedProofRequest]:
@@ -177,7 +239,14 @@ class DSperseManager:
         _, requests = self.start_run(circuit)
         return requests
 
-    def on_slice_result(self, run_uid: str, slice_num: str, success: bool) -> bool:
+    def on_slice_result(
+        self,
+        run_uid: str,
+        slice_num: str,
+        success: bool,
+        response_time_sec: float = 0.0,
+        verification_time_sec: float = 0.0,
+    ) -> bool:
         if run_uid not in self.runs:
             logging.warning(f"on_slice_result: Run {run_uid} not found")
             return False
@@ -197,12 +266,52 @@ class DSperseManager:
 
         if slice_num in run.slices:
             run.slices[slice_num].success = success
+            if run.slices[slice_num].timing:
+                run.slices[slice_num].timing.response_time_sec = response_time_sec
+                run.slices[slice_num].timing.verification_time_sec = (
+                    verification_time_sec
+                )
+                run.slices[slice_num].timing.success = success
+
+        if self.event_client:
+            if success:
+                self._schedule_async(
+                    self.event_client.emit_verification_complete(
+                        run_uid=run_uid,
+                        slice_num=slice_num,
+                        verification_time_sec=verification_time_sec,
+                        success=True,
+                    )
+                )
+            else:
+                self._schedule_async(
+                    self.event_client.emit_slice_failed(
+                        run_uid=run_uid,
+                        slice_num=slice_num,
+                    )
+                )
 
         if run.is_complete:
             logging.info(
                 f"Run {run_uid} complete. "
                 f"Completed: {len(run.completed)}, Failed: {len(run.failed)}"
             )
+            total_run_time = (
+                time.perf_counter() - run.start_time if run.start_time else None
+            )
+            if self.event_client:
+                self._schedule_async(
+                    self.event_client.emit_run_complete(
+                        run_uid=run_uid,
+                        all_successful=run.all_successful,
+                        total_run_time_sec=total_run_time,
+                    )
+                )
+            try:
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(None, self._submit_metrics, run)
+            except RuntimeError:
+                self._submit_metrics(run)
             if run.callback:
                 try:
                     run.callback(run)
@@ -211,6 +320,118 @@ class DSperseManager:
             self.cleanup_run(run_uid)
 
         return run.is_complete
+
+    def _submit_metrics(self, run: DsperseRun):
+        """Submit dsperse run metrics to sn2-api."""
+        try:
+            import httpx
+
+            total_run_time = (
+                time.perf_counter() - run.start_time if run.start_time else 0.0
+            )
+
+            total_witness_time = 0.0
+            total_response_time = 0.0
+            total_verification_time = 0.0
+            circuit_slices = 0
+            onnx_slices = 0
+
+            slice_metrics = []
+            for slice_data in run.slices.values():
+                if slice_data.timing:
+                    timing = slice_data.timing
+                    total_witness_time += timing.witness_time_sec
+                    total_response_time += timing.response_time_sec
+                    total_verification_time += timing.verification_time_sec
+                    circuit_slices += 1
+
+                    slice_metrics.append(
+                        {
+                            "slice_num": timing.slice_num,
+                            "proof_system": timing.proof_system,
+                            "backend_used": timing.backend_used,
+                            "witness_time_sec": timing.witness_time_sec,
+                            "response_time_sec": timing.response_time_sec,
+                            "verification_time_sec": timing.verification_time_sec,
+                            "is_tiled": timing.is_tiled,
+                            "tile_count": timing.tile_count,
+                            "memory_peak_mb": timing.memory_peak_mb,
+                            "success": timing.success,
+                            "error": timing.error,
+                        }
+                    )
+                else:
+                    onnx_slices += 1
+
+            payload = {
+                "run_uid": run.run_uid,
+                "validator_key": self._get_validator_hotkey(),
+                "circuit_id": run.circuit_id,
+                "circuit_name": run.circuit_name,
+                "total_slices": len(run.slices),
+                "circuit_slices": circuit_slices,
+                "onnx_slices": onnx_slices,
+                "total_witness_time_sec": total_witness_time,
+                "total_response_time_sec": total_response_time,
+                "total_verification_time_sec": total_verification_time,
+                "total_run_time_sec": total_run_time,
+                "all_successful": run.all_successful,
+                "failed_slice_count": len(run.failed),
+                "environment": run.environment,
+                "slices": slice_metrics,
+            }
+
+            api_url = getattr(cli_parser.config, "sn2_api_url", None)
+            if not api_url:
+                api_url = "https://sn2-api.inferencelabs.com"
+
+            hotkey = self._get_validator_hotkey()
+            body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            signature = self._sign_request(body)
+
+            if hotkey == "unknown" or not signature:
+                logging.warning(
+                    f"Skipping metrics submission for run {run.run_uid}: "
+                    f"invalid hotkey or signature"
+                )
+                return
+
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    f"{api_url}/statistics/dsperse/log/",
+                    content=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Signature": signature,
+                        "X-Hotkey": hotkey,
+                    },
+                )
+                if response.status_code == 200:
+                    logging.debug(f"Metrics submitted for run {run.run_uid}")
+                else:
+                    logging.warning(
+                        f"Failed to submit metrics for run {run.run_uid}: "
+                        f"{response.status_code} - {response.text}"
+                    )
+        except Exception as e:
+            logging.warning(f"Failed to submit dsperse metrics: {e}")
+
+    def _get_validator_hotkey(self) -> str:
+        try:
+            return cli_parser.config.wallet.hotkey.ss58_address
+        except Exception:
+            return "unknown"
+
+    def _sign_request(self, body: str) -> str:
+        try:
+            import hashlib
+
+            wallet = cli_parser.config.wallet
+            message = hashlib.sha256(body.encode()).hexdigest()
+            signature = wallet.hotkey.sign(message.encode())
+            return signature.hex()
+        except Exception:
+            return ""
 
     def get_run_status(self, run_uid: str) -> dict | None:
         if run_uid not in self.runs:
@@ -283,6 +504,21 @@ class DSperseManager:
                             tile_output,
                         )
 
+                    timing = SliceTimingData(
+                        slice_num=f"{base_slice_num}_tile_{tile_idx}",
+                        proof_system=(
+                            str(tile_result.method) if tile_result.method else None
+                        ),
+                        backend_used=(
+                            str(tile_result.method) if tile_result.method else None
+                        ),
+                        witness_time_sec=tile_result.time_sec,
+                        is_tiled=True,
+                        tile_count=len(circuit_tiles),
+                        success=tile_result.success,
+                        error=tile_result.error,
+                    )
+
                     dslice_data_list.append(
                         DSliceData(
                             slice_num=f"{base_slice_num}_tile_{tile_idx}",
@@ -293,6 +529,7 @@ class DSperseManager:
                             proof_system=DSperseManager._method_to_proof_system(
                                 tile_result.method
                             ),
+                            timing=timing,
                         )
                     )
             else:
@@ -303,6 +540,17 @@ class DSperseManager:
                     logging.warning(f"Slice {slice_num} missing input/output files")
                     continue
 
+                timing = SliceTimingData(
+                    slice_num=base_slice_num,
+                    proof_system=method,
+                    backend_used=method,
+                    witness_time_sec=exec_info.witness_time_sec,
+                    memory_peak_mb=exec_info.memory_peak_mb,
+                    is_tiled=False,
+                    success=exec_info.success,
+                    error=exec_info.error,
+                )
+
                 dslice_data_list.append(
                     DSliceData(
                         slice_num=base_slice_num,
@@ -311,6 +559,7 @@ class DSperseManager:
                         witness_file=slice_run_dir / "output_witness.bin",
                         circuit_id=circuit_id,
                         proof_system=DSperseManager._method_to_proof_system(method),
+                        timing=timing,
                     )
                 )
 
