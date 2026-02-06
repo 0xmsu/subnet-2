@@ -642,7 +642,7 @@ wheels = [
 
 [[package]]
 name = "dsperse"
-version = "3.0.0"
+version = "3.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama" },
@@ -659,9 +659,9 @@ dependencies = [
     { name = "torch", version = "2.7.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/65/1c/bdc1b960bfbd4588672901f18ff1cc0c52cb658949dd863f2ad17f6ac872/dsperse-3.0.0.tar.gz", hash = "sha256:3b9434d38f5e2301a44135a9010572ff465344cd07c6ccc90df6c3b2b26b614b", size = 1978020, upload-time = "2026-02-03T21:32:25.523Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/02/e441ebab481c8e202f3953c5cfc8d3f70051776c4c75ab8ef2e662a58cb8/dsperse-3.1.0.tar.gz", hash = "sha256:4cb0fe264f5591ba83e29ab2d136380baaa0dcf3a7301228c99bab7b6fe403eb", size = 1978009, upload-time = "2026-02-05T22:16:17.075Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/0f/1710a562fe63a7b1120415bfa5f906a9eeaca731b6ce01ff5ffa640c5a19/dsperse-3.0.0-py3-none-any.whl", hash = "sha256:d62c9f119754ae5e20ae5d1bc61f2b585a189eb5d273765b64de0fb83db17afb", size = 1991653, upload-time = "2026-02-03T21:32:23.168Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/a0/53587b9d2f5739374341463e1c25da7435f8e26cf369ffdd46b4bfdeb2e5/dsperse-3.1.0-py3-none-any.whl", hash = "sha256:6b5c1c219c4c6ec8a78214c1b8166c89415e6a8a501adad79435862aa31a06fb", size = 1991561, upload-time = "2026-02-05T22:16:15.65Z" },
 ]
 
 [[package]]
@@ -2654,7 +2654,7 @@ requires-dist = [
     { name = "bittensor", specifier = "==10.0.1" },
     { name = "boto3", specifier = ">=1.36.13" },
     { name = "botocore", specifier = ">=1.37.19" },
-    { name = "dsperse", specifier = "==3.0.0" },
+    { name = "dsperse", specifier = "==3.1.0" },
     { name = "fastapi", specifier = ">=0.115.6" },
     { name = "gitpython", specifier = ">=3.1.44" },
     { name = "httpx", specifier = ">=0.28.1" },
