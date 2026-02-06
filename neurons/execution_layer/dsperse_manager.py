@@ -544,12 +544,13 @@ class DSperseManager:
                     logging.warning(f"Slice {slice_num} missing input/output files")
                     continue
 
+                # TODO: DSperse ExecutionInfo should expose time_sec for per-slice timing
                 timing = SliceTimingData(
                     slice_num=base_slice_num,
                     proof_system=method,
                     backend_used=method,
-                    witness_time_sec=exec_info.witness_time_sec,
-                    memory_peak_mb=exec_info.memory_peak_mb,
+                    witness_time_sec=getattr(exec_info, "time_sec", 0.0),
+                    memory_peak_mb=getattr(exec_info, "memory_peak_mb", 0.0),
                     is_tiled=False,
                     success=exec_info.success,
                     error=exec_info.error,

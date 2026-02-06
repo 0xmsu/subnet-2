@@ -84,8 +84,9 @@ class ValidatorLoop:
         self.current_concurrency = MAX_CONCURRENT_REQUESTS
         self.capacity_manager = CapacityManager(self.config, self.httpx_client)
 
-        api_url = getattr(
-            cli_parser.config, "sn2_api_url", "https://sn2-api.inferencelabs.com"
+        api_url = (
+            getattr(cli_parser.config, "sn2_api_url", None)
+            or "https://sn2-api.inferencelabs.com"
         )
         self.dsperse_event_client = DsperseEventClient(api_url, config.wallet)
         self.dsperse_manager = DSperseManager(event_client=self.dsperse_event_client)

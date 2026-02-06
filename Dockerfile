@@ -1,15 +1,9 @@
 FROM --platform=linux/amd64 ubuntu:noble
 
-# Install dependencies and Python 3.13 free-threaded (no GIL)
+COPY --from=ghcr.io/astral-sh/uv:0.6.6 /uv /uvx /bin/
+
 RUN apt update && \
-    apt install -y software-properties-common && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt update && \
     apt install -y \
-    python3.13-nogil \
-    python3.13-nogil-dev \
-    python3.13-nogil-venv \
-    pipx \
     build-essential \
     jq \
     git \
@@ -24,16 +18,17 @@ RUN apt update && \
     protobuf-compiler \
     ffmpeg \
     gosu \
+    libopenmpi-dev \
+    openmpi-bin \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
-# Set Python 3.13 free-threaded as default
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13t 1
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+RUN uv python install 3.13t && \
+    chmod -R 755 /opt/python
 
-# Make directories under opt and set owner to ubuntu
 RUN mkdir -p /opt/.cargo /opt/.nvm /opt/.npm /opt/.snarkjs /opt/subnet-2/neurons && \
-    chown -R ubuntu:ubuntu /opt && \
-    chmod -R 775 /opt/subnet-2 && \
-    chown root:root /opt
+    chown -R ubuntu:ubuntu /opt/.cargo /opt/.nvm /opt/.npm /opt/.snarkjs /opt/subnet-2 && \
+    chmod -R 775 /opt/subnet-2
 
 # Use ubuntu user
 USER ubuntu
@@ -57,10 +52,9 @@ ENV PATH="/home/ubuntu/.local/bin:${PATH}"
 COPY --chown=ubuntu:ubuntu --chmod=775 neurons /opt/subnet-2/neurons
 COPY --chown=ubuntu:ubuntu --chmod=775 pyproject.toml /opt/subnet-2/pyproject.toml
 COPY --chown=ubuntu:ubuntu --chmod=775 uv.lock /opt/subnet-2/uv.lock
-RUN pipx install uv && \
-    cd /opt/subnet-2 && \
-    ~/.local/bin/uv sync --frozen --no-dev --compile-bytecode --python 3.13t && \
-    ~/.local/bin/uv cache clean && \
+RUN cd /opt/subnet-2 && \
+    uv sync --frozen --no-dev --compile-bytecode --python 3.13t && \
+    uv cache clean && \
     echo "source /opt/subnet-2/.venv/bin/activate" >> ~/.bashrc && \
     chmod -R 775 /opt/subnet-2/.venv
 ENV PATH="/opt/subnet-2/.venv/bin:${PATH}"
