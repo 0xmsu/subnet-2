@@ -15,6 +15,11 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/inference-labs-inc/subnet-2.git || true
@@ -23,16 +28,11 @@ jobs:
       - name: Sync main branch
         run: |
           git checkout main
-          # Try fast-forward merge first (no conflicts possible)
-          if git merge upstream/main --no-edit --ff-only; then
-            echo "Fast-forward merge successful"
+          if git merge upstream/main --no-edit; then
+            echo "Merge successful"
           else
-            echo "Fast-forward not possible, attempting merge..."
-            # If regular merge fails, abort and force-reset to upstream
-            if ! git merge upstream/main --no-edit; then
-              echo "Merge conflict detected, resetting to upstream"
-              git merge --abort
-              git reset --hard upstream/main
-            fi
+            echo "Merge conflict detected, resetting to upstream"
+            git merge --abort
+            git reset --hard upstream/main
           fi
           git push origin main
