@@ -15,7 +15,12 @@ import ezkl
 import requests
 
 import cli_parser
-from constants import FIVE_MINUTES, IGNORED_MODEL_HASHES, Roles
+from constants import (
+    CIRCUIT_METADATA_FILENAME,
+    FIVE_MINUTES,
+    IGNORED_MODEL_HASHES,
+    Roles,
+)
 
 LOCAL_SNARKJS_INSTALL_DIR = os.path.join(os.path.expanduser("~"), ".snarkjs")
 LOCAL_SNARKJS_PATH = os.path.join(
@@ -59,7 +64,6 @@ def run_shared_preflight_checks(role: Optional[Roles] = None):
             "Checking SnarkJS installation": ensure_snarkjs_installed,
             "Checking EZKL installation": ensure_ezkl_installed,
             "Checking MPI installation": ensure_mpi_installed,
-            "Checking JSTprove installation": ensure_jstprove_installed,
             "Syncing model files": partial(sync_models, role=role),
         }
     )
@@ -120,29 +124,6 @@ def ensure_mpi_installed():
                 "MPI is required but not installed. Please install OpenMPI manually."
             )
         bt.logging.info("MPI installed successfully")
-
-
-def ensure_jstprove_installed():
-    """
-    Ensure JSTprove is installed via uv tool.
-    """
-    jst_path = os.path.join(os.path.expanduser("~"), ".local", "bin", "jst")
-    if os.path.exists(jst_path) and os.access(jst_path, os.X_OK):
-        bt.logging.info(f"JSTprove is installed at {jst_path}")
-        return
-
-    bt.logging.warning("JSTprove not found. Installing via uv...")
-    try:
-        subprocess.run(
-            ["uv", "tool", "install", "--python", "3.12", "JSTprove"],
-            check=True,
-        )
-        bt.logging.info("JSTprove installed successfully")
-    except subprocess.CalledProcessError as e:
-        bt.logging.error(f"Failed to install JSTprove: {e}")
-        raise RuntimeError(
-            "JSTprove installation failed. Please install it manually with: uv tool install --python 3.12 JSTprove"
-        ) from e
 
 
 def ensure_ezkl_installed():
@@ -237,6 +218,18 @@ def sync_models(role: Optional[Roles] = None):
     from execution_layer.dsperse_manager import DSperseManager
     from execution_layer.circuit import CircuitType
 
+    if not getattr(cli_parser.config, "download_all_circuits", False):
+        bt.logging.info(
+            SYNC_LOG_PREFIX
+            + "Skipping circuit download (use --download-all-circuits to enable)"
+        )
+        return
+
+    bt.logging.warning(
+        SYNC_LOG_PREFIX
+        + "Downloading all circuits may consume a large amount of storage"
+    )
+
     MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "deployment_layer")
 
     loop = asyncio.get_event_loop()
@@ -271,10 +264,11 @@ def sync_models(role: Optional[Roles] = None):
             )
             continue
 
-        metadata_file = model_path / "metadata.json"
+        metadata_file = model_path / CIRCUIT_METADATA_FILENAME
         if not metadata_file.is_file():
             bt.logging.warning(
-                SYNC_LOG_PREFIX + f"Skipping {model_path.name} - no metadata.json"
+                SYNC_LOG_PREFIX
+                + f"Skipping {model_path.name} - no {CIRCUIT_METADATA_FILENAME}"
             )
             continue
 

@@ -159,7 +159,7 @@ class RequestPipeline:
         return random.choices(
             circuits,
             weights=[
-                (circuit.metadata.benchmark_choice_weight or 0) for circuit in circuits
+                (circuit.metadata.benchmark_choice_weight or 1) for circuit in circuits
             ],
             k=1,
         )[0]
@@ -170,15 +170,14 @@ class RequestPipeline:
         circuit: Circuit,
         request: any | None = None,
     ) -> tuple[ProofOfWeightsDataModel | QueryZkProof, bool]:
-        inputs = (
-            circuit.input_handler(request_type)
-            if request_type == RequestType.BENCHMARK
-            else circuit.input_handler(
-                request_type,
-                copy.deepcopy(request.inputs),
-            )
-        )
-        inputs = inputs.to_json() if hasattr(inputs, "to_json") else inputs
+        if request_type == RequestType.DSLICE:
+            inputs = request.inputs
+        elif request_type == RequestType.BENCHMARK:
+            inputs = circuit.input_handler(request_type)
+            inputs = inputs.to_json() if hasattr(inputs, "to_json") else inputs
+        else:
+            inputs = circuit.input_handler(request_type, copy.deepcopy(request.inputs))
+            inputs = inputs.to_json() if hasattr(inputs, "to_json") else inputs
 
         if request_type == RequestType.RWR:
             if circuit.metadata.type == CircuitType.PROOF_OF_WEIGHTS:
@@ -213,6 +212,8 @@ class RequestPipeline:
                 False,
             )
         elif circuit.metadata.type == CircuitType.DSPERSE_PROOF_GENERATION:
+            if request is None:
+                return None, False
             return (
                 DSliceProofGenerationDataModel(
                     circuit=circuit.id,
@@ -227,7 +228,7 @@ class RequestPipeline:
 
         return (
             ProofOfWeightsDataModel(
-                subnet_uid=circuit.metadata.netuid,
+                subnet_uid=circuit.metadata.netuid or 0,
                 verification_key_hash=circuit.id,
                 proof_system=circuit.proof_system,
                 inputs=inputs,

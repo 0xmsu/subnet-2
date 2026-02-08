@@ -82,6 +82,7 @@ class ValidatorAPI:
         self.pending_requests: dict[str, asyncio.Event] = {}
         self.request_results: dict[str, dict[str, any]] = {}
         self.is_testnet = config.bt_config.subtensor.network == "test"
+        self.dsperse_manager = None
         self._setup_api()
 
     def _setup_api(self) -> None:
@@ -97,7 +98,7 @@ class ValidatorAPI:
         if self.config.api.certificate_path:
             cert_manager = CertificateManager(self.config.api.certificate_path)
             cert_manager.ensure_valid_certificate(
-                bt.axon(self.config.wallet).external_ip
+                bt.Axon(self.config.wallet).external_ip
             )
             self.commit_cert_hash()
 
@@ -120,6 +121,8 @@ class ValidatorAPI:
                     methods={
                         "subnet-2.proof_of_weights": self.handle_proof_of_weights,
                         "subnet-2.proof_of_computation": self.handle_proof_of_computation,
+                        "subnet-2.dsperse_submit": self.handle_dsperse_submit,
+                        "subnet-2.run_status": self.handle_run_status,
                     },
                 )
                 await websocket.send_text(str(response))
@@ -377,6 +380,88 @@ class ValidatorAPI:
             traceback.print_exc()
             return Error(9, "Request processing failed", str(e))
 
+    async def handle_dsperse_submit(
+        self, websocket: WebSocket, **params: dict[str, object]
+    ) -> dict[str, object]:
+        circuit_id = params.get("circuit_id")
+        inputs = params.get("inputs")
+
+        if not circuit_id:
+            return InvalidParams("Missing circuit_id")
+        if not inputs or not isinstance(inputs, dict):
+            return InvalidParams("Missing or invalid inputs")
+
+        try:
+            circuit = circuit_store.ensure_circuit(circuit_id)
+            if not self.dsperse_manager:
+                return Error(10, "DSperse manager not initialized")
+
+            bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
+
+            loop = asyncio.get_event_loop()
+            run_uid, requests = await loop.run_in_executor(
+                None,
+                lambda: self.dsperse_manager.start_run(circuit, inputs),
+            )
+
+            for request in requests:
+                self.stacked_requests_queue.append(request)
+
+            status = self.dsperse_manager.get_run_status(run_uid)
+            bt.logging.success(
+                f"Run {run_uid} created: {status['total_slices']} slices queued"
+            )
+
+            return Success(
+                {"run_uid": run_uid, "status": "processing", "progress": status}
+            )
+
+        except Exception as e:
+            bt.logging.error(f"Error in DSperse submission: {str(e)}")
+            traceback.print_exc()
+            return Error(9, "DSperse submission failed", str(e))
+
+    async def handle_run_status(
+        self, websocket: WebSocket, **params: dict[str, object]
+    ) -> dict[str, object]:
+        run_uid = params.get("run_uid")
+
+        if not run_uid:
+            return InvalidParams("Missing run_uid")
+
+        if not self.dsperse_manager:
+            return Error(10, "DSperse manager not initialized")
+
+        status = self.dsperse_manager.get_run_status(run_uid)
+        if not status:
+            return Error(11, "Run not found", f"No run with ID {run_uid}")
+
+        try:
+            if status["is_complete"]:
+                run_status = (
+                    "completed" if status["all_successful"] else "completed_with_errors"
+                )
+                self._cleanup_run(run_uid)
+            else:
+                run_status = "processing"
+
+            return Success(
+                {"run_uid": run_uid, "status": run_status, "progress": status}
+            )
+
+        except Exception as e:
+            bt.logging.error(f"Error getting run status: {str(e)}")
+            traceback.print_exc()
+            return Error(9, "Failed to get run status", str(e))
+
+    def _cleanup_run(self, run_uid: str) -> None:
+        if self.dsperse_manager:
+            try:
+                self.dsperse_manager.cleanup_run(run_uid)
+            except ValueError:
+                bt.logging.debug(f"Run {run_uid} already cleaned up or not found")
+        bt.logging.info(f"Run {run_uid} completed and cleaned up")
+
     def start_server(self):
         """Start the uvicorn server in a separate thread"""
         self.server_thread = threading.Thread(
@@ -399,7 +484,7 @@ class ValidatorAPI:
             return
         try:
             bt.logging.info(f"Serving axon on port {self.config.api.port}")
-            axon = bt.axon(
+            axon = bt.Axon(
                 wallet=self.config.wallet, external_port=self.config.api.port
             )
             existing_axon = self.config.metagraph.axons[self.config.user_uid]

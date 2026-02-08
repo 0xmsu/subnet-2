@@ -10,12 +10,14 @@ from enum import Enum
 import torch
 
 # trunk-ignore(pylint/E0611)
-from bittensor import Wallet, logging, subtensor
+from bittensor import Wallet, logging, Subtensor
 from execution_layer.base_input import BaseInput
 from execution_layer.input_registry import InputRegistry
 
 import cli_parser
 from constants import (
+    CIRCUIT_CACHE_DIR,
+    CIRCUIT_METADATA_FILENAME,
     CIRCUIT_TIMEOUT_SECONDS,
     DEFAULT_PROOF_SIZE,
     MAX_EVALUATION_ITEMS,
@@ -32,9 +34,17 @@ class CircuitType(str, Enum):
     Enum representing the type of circuit.
     """
 
-    PROOF_OF_WEIGHTS = "proof_of_weights"
-    PROOF_OF_COMPUTATION = "proof_of_computation"
-    DSPERSE_PROOF_GENERATION = "dsperse_proof_generation"
+    PROOF_OF_WEIGHTS = "PROOF_OF_WEIGHTS"
+    PROOF_OF_COMPUTATION = "PROOF_OF_COMPUTATION"
+    DSPERSE_PROOF_GENERATION = "DSPERSE_PROOF_GENERATION"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            upper = value.upper()
+            if upper != value and upper in cls._value2member_map_:
+                return cls._value2member_map_[upper]
+        raise ValueError(f"Cannot convert {value} to {cls.__name__}")
 
 
 class ProofSystem(str, Enum):
@@ -55,7 +65,9 @@ class ProofSystem(str, Enum):
     @classmethod
     def _missing_(cls, value):
         if isinstance(value, str):
-            return cls(value.upper())
+            upper = value.upper()
+            if upper != value and upper in cls._value2member_map_:
+                return cls._value2member_map_[upper]
         raise ValueError(f"Cannot convert {value} to {cls.__name__}")
 
     def to_json(self):
@@ -68,10 +80,6 @@ class ProofSystem(str, Enum):
 
 @dataclass
 class CircuitPaths:
-    """
-    Paths to all files for the provided model.
-    """
-
     model_id: str
     base_path: str = field(init=False)
     input: str = field(init=False)
@@ -86,12 +94,21 @@ class CircuitPaths:
     witness_executable: str = field(init=False)
 
     def __post_init__(self):
-        self.base_path = os.path.join(
+        cache_path = os.path.join(CIRCUIT_CACHE_DIR, f"model_{self.model_id}")
+        deployment_path = os.path.join(
             os.path.dirname(__file__),
             "..",
             "deployment_layer",
             f"model_{self.model_id}",
         )
+
+        if os.path.exists(cache_path):
+            self.base_path = cache_path
+        elif os.path.exists(deployment_path):
+            self.base_path = deployment_path
+        else:
+            self.base_path = cache_path
+
         if hasattr(cli_parser, "config") and cli_parser.config.full_path_models:
             self.external_base_path = os.path.join(
                 cli_parser.config.full_path_models,
@@ -106,7 +123,7 @@ class CircuitPaths:
                 f"model_{self.model_id}",
             )
         self.input = os.path.join(self.base_path, "input.json")
-        self.metadata = os.path.join(self.base_path, "metadata.json")
+        self.metadata = os.path.join(self.base_path, CIRCUIT_METADATA_FILENAME)
         self.compiled_model = os.path.join(self.base_path, "model.compiled")
         self.settings = os.path.join(self.base_path, "settings.json")
         self.witness = os.path.join(self.base_path, "witness.json")
@@ -142,10 +159,6 @@ class CircuitPaths:
 
 @dataclass
 class CircuitMetadata:
-    """
-    Metadata for a specific model, such as name, version, description, etc.
-    """
-
     name: str
     description: str
     author: str
@@ -158,21 +171,18 @@ class CircuitMetadata:
     weights_version: int | None = None
     timeout: int | None = None
     benchmark_choice_weight: float | None = None
+    input_schema: dict | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CircuitMetadata:
+        d.setdefault("external_files", None)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in valid_fields})
 
     @classmethod
     def from_file(cls, metadata_path: str) -> CircuitMetadata:
-        """
-        Create a ModelMetadata instance from a JSON file.
-
-        Args:
-            metadata_path (str): Path to the metadata JSON file.
-
-        Returns:
-            ModelMetadata: An instance of ModelMetadata.
-        """
         with open(metadata_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-        return cls(**metadata)
+            return cls.from_dict(json.load(f))
 
 
 @dataclass
@@ -295,7 +305,7 @@ class CircuitEvaluationData:
                 if len(proof_sizes) > 0
                 else 0
             )
-            sub = subtensor(config=cli_parser.config)
+            sub = Subtensor(config=cli_parser.config)
             last_block = sub.get_current_block()
             wallet = Wallet(config=cli_parser.config)
 
@@ -372,18 +382,7 @@ class CircuitEvaluationData:
 
 
 class Circuit:
-    """
-    A class representing a circuit.
-    """
-
-    def __init__(self, circuit_id: str):
-        """
-        Initialize a Model instance.
-
-        Args:
-            circuit_id (str): Unique identifier for the model.
-        """
-
+    def __init__(self, circuit_id: str, metadata: CircuitMetadata | None = None):
         if not circuit_id:
             raise ValueError("Circuit ID cannot be empty")
 
@@ -392,6 +391,7 @@ class Circuit:
                 "Circuit ID must be a valid SHA-256 hash (64 lowercase hex characters)"
             )
 
+        cache_folder = os.path.join(CIRCUIT_CACHE_DIR, f"model_{circuit_id}")
         deployment_folder = os.path.join(
             os.path.dirname(__file__),
             "..",
@@ -399,16 +399,21 @@ class Circuit:
             f"model_{circuit_id}",
         )
 
-        if not os.path.exists(deployment_folder):
+        folder_exists = os.path.exists(cache_folder) or os.path.exists(
+            deployment_folder
+        )
+
+        if not folder_exists and metadata is None:
             raise ValueError(f"Circuit folder does not exist: model_{circuit_id}")
 
-        if not os.path.isdir(deployment_folder):
-            raise ValueError(f"Circuit path is not a directory: model_{circuit_id}")
-
-        # XXX: might not fit to dsperse...
         self.paths = CircuitPaths(circuit_id)
-        self.metadata = CircuitMetadata.from_file(self.paths.metadata)
         self.id = circuit_id
+
+        if metadata is not None:
+            self.metadata = metadata
+        else:
+            self.metadata = CircuitMetadata.from_file(self.paths.metadata)
+
         self.proof_system = ProofSystem[self.metadata.proof_system]
         self.paths.set_proof_system_paths(self.proof_system)
         self.settings = {}
@@ -418,14 +423,18 @@ class Circuit:
             if hasattr(self.metadata, "timeout") and self.metadata.timeout is not None
             else CIRCUIT_TIMEOUT_SECONDS
         )
-        try:
-            with open(self.paths.settings, "r", encoding="utf-8") as f:
-                self.settings = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            logging.warning(
-                f"Failed to load settings for model {self.id}. Using default settings."
-            )
-        self.input_handler: BaseInput = InputRegistry.get_handler(self.id)
+        if self.proof_system not in (ProofSystem.JSTPROVE,):
+            try:
+                with open(self.paths.settings, "r", encoding="utf-8") as f:
+                    self.settings = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                raise RuntimeError(
+                    f"Failed to load required settings for circuit {self.id} "
+                    f"at {self.paths.settings}"
+                ) from e
+        self.input_handler: BaseInput = InputRegistry.get_handler(
+            self.id, metadata=self.metadata
+        )
 
     def __str__(self):
         return (
