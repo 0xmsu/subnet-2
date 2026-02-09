@@ -9,6 +9,7 @@ import bittensor as bt
 import httpx
 from packaging import version
 
+import cli_parser
 from constants import (
     CIRCUIT_API_URL,
     CIRCUIT_CACHE_DIR,
@@ -16,7 +17,7 @@ from constants import (
     IGNORED_MODEL_HASHES,
     MAINNET_TESTNET_UIDS,
 )
-from execution_layer.circuit import Circuit, CircuitMetadata, CircuitType
+from execution_layer.circuit import Circuit, CircuitMetadata
 
 
 class CircuitStore:
@@ -49,11 +50,29 @@ class CircuitStore:
         except Exception as e:
             bt.logging.warning(f"Failed to fetch active circuits from API: {e}")
 
+        additional = getattr(cli_parser.config, "additional_circuits", None) or []
+        if additional:
+            if active_ids is None:
+                active_ids = set()
+            active_ids.update(additional)
+            bt.logging.info(
+                f"Including {len(additional)} additional circuits: {additional}"
+            )
+
         self._load_from_filesystem(deployment_layer_path, active_ids)
         self._load_from_cache(active_ids)
 
         if api_data is not None:
             self._load_from_api(api_data)
+
+        for circuit_id in additional:
+            if circuit_id not in self.circuits:
+                try:
+                    self.ensure_circuit(circuit_id)
+                except Exception as e:
+                    bt.logging.warning(
+                        f"Failed to load additional circuit {circuit_id}: {e}"
+                    )
 
         bt.logging.info(f"Loaded {len(self.circuits)} circuits")
 
@@ -108,10 +127,6 @@ class CircuitStore:
                     )
                     continue
                 metadata = CircuitMetadata.from_dict(metadata_dict)
-                if metadata.type == CircuitType.DSPERSE_PROOF_GENERATION:
-                    from execution_layer.dsperse_manager import DSperseManager
-
-                    DSperseManager.extract_dslices(folder_path)
                 circuit = Circuit(circuit_id, metadata=metadata)
                 self.circuits[circuit_id] = circuit
                 bt.logging.info(f"Loaded circuit {circuit_id} from cache")
@@ -138,11 +153,6 @@ class CircuitStore:
             try:
                 self._cache_circuit(circuit_id, circuit_data)
                 metadata = CircuitMetadata.from_dict(circuit_data.get("metadata", {}))
-                if metadata.type == CircuitType.DSPERSE_PROOF_GENERATION:
-                    from execution_layer.dsperse_manager import DSperseManager
-
-                    cache_path = os.path.join(self._cache_dir, f"model_{circuit_id}")
-                    DSperseManager.extract_dslices(cache_path)
                 circuit = Circuit(circuit_id, metadata=metadata)
                 self.circuits[circuit_id] = circuit
                 bt.logging.info(f"Loaded circuit {circuit_id} from API")
@@ -155,8 +165,6 @@ class CircuitStore:
         os.makedirs(cache_path, exist_ok=True)
 
         metadata = circuit_data.get("metadata", {})
-        critical_files = set(metadata.get("critical_files", []))
-
         files = circuit_data.get("files", {})
         failed_downloads = []
         for filename, url in files.items():
@@ -170,22 +178,17 @@ class CircuitStore:
                 )
                 failed_downloads.append(filename)
 
-        failed_critical = critical_files & set(failed_downloads)
-        complete = len(failed_critical) == 0
-
-        metadata["complete"] = complete
+        metadata["complete"] = len(failed_downloads) == 0
         metadata_path = os.path.join(cache_path, CIRCUIT_METADATA_FILENAME)
         with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
         if failed_downloads:
-            bt.logging.warning(
-                f"Circuit {circuit_id}: {len(failed_downloads)}/{len(files)} files failed to download"
-            )
-
-        if failed_critical:
+            sample = failed_downloads[:5]
+            suffix = "..." if len(failed_downloads) > 5 else ""
             raise RuntimeError(
-                f"Circuit {circuit_id} missing critical files: {', '.join(sorted(failed_critical))}"
+                f"Circuit {circuit_id}: {len(failed_downloads)}/{len(files)} "
+                f"files failed: {sample}{suffix}"
             )
 
     def _download_file(self, url: str, dest_path: str):
@@ -232,7 +235,19 @@ class CircuitStore:
     def refresh_circuits(self):
         try:
             circuits_data = self._fetch_circuits_from_api()
+            existing_ids = set(self.circuits.keys())
             self._load_from_api(circuits_data)
+            new_ids = set(self.circuits.keys()) - existing_ids
+            for circuit_id in new_ids:
+                circuit = self.circuits[circuit_id]
+                file_count = len(circuits_data)
+                for cd in circuits_data:
+                    if cd.get("id") == circuit_id:
+                        file_count = len(cd.get("files", {}))
+                        break
+                bt.logging.info(
+                    f"Found new circuit: {circuit.metadata.name} v{circuit.metadata.version} ({file_count} files)"
+                )
         except Exception as e:
             bt.logging.warning(f"Failed to refresh circuits from API: {e}")
 
@@ -251,11 +266,6 @@ class CircuitStore:
 
         self._cache_circuit(circuit_id, circuit_data)
         metadata = CircuitMetadata.from_dict(circuit_data.get("metadata", {}))
-        if metadata.type == CircuitType.DSPERSE_PROOF_GENERATION:
-            from execution_layer.dsperse_manager import DSperseManager
-
-            cache_path = os.path.join(self._cache_dir, f"model_{circuit_id}")
-            DSperseManager.extract_dslices(cache_path)
         circuit = Circuit(circuit_id, metadata=metadata)
         self.circuits[circuit_id] = circuit
         bt.logging.success(f"Fetched and loaded circuit {circuit_id}")

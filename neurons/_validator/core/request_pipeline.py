@@ -1,21 +1,14 @@
 from __future__ import annotations
 
 import copy
+import os
 import random
 import traceback
 
 import bittensor as bt
 from bittensor.core.chain_data import AxonInfo
-from deployment_layer.circuit_store import circuit_store
-from execution_layer.circuit import Circuit, CircuitType
-from execution_layer.generic_input import GenericInput
-from protocol import (
-    DSliceProofGenerationDataModel,
-    ProofOfWeightsDataModel,
-    QueryZkProof,
-)
 
-from _validator.api import ValidatorAPI
+from _validator.api import RelayManager
 from _validator.config import ValidatorConfig
 from _validator.core.request import Request
 from _validator.models.request_type import RequestType
@@ -26,16 +19,43 @@ from constants import (
     BATCHED_PROOF_OF_WEIGHTS_MODEL_ID,
     SINGLE_PROOF_OF_WEIGHTS_MODEL_ID,
 )
+from deployment_layer.circuit_store import circuit_store
+from execution_layer.circuit import Circuit, CircuitType
+from execution_layer.generic_input import GenericInput
+from protocol import (
+    DSliceProofGenerationDataModel,
+    ProofOfWeightsDataModel,
+    QueryZkProof,
+)
 from utils.wandb_logger import safe_log
+
+
+def _get_local_miner_overrides() -> dict[int, tuple[str, int]]:
+    """Parse LOCAL_MINER_OVERRIDE env var: 'uid:ip:port,uid:ip:port,...'"""
+    override_str = os.environ.get("LOCAL_MINER_OVERRIDE", "")
+    if not override_str:
+        return {}
+    overrides = {}
+    for entry in override_str.split(","):
+        parts = entry.strip().split(":")
+        if len(parts) == 3:
+            try:
+                uid = int(parts[0])
+                ip = parts[1]
+                port = int(parts[2])
+                overrides[uid] = (ip, port)
+            except ValueError:
+                pass
+    return overrides
 
 
 class RequestPipeline:
     def __init__(
-        self, config: ValidatorConfig, score_manager: ScoreManager, api: ValidatorAPI
+        self, config: ValidatorConfig, score_manager: ScoreManager, relay: RelayManager
     ):
         self.config = config
         self.score_manager = score_manager
-        self.api = api
+        self.relay = relay
         self.hash_guard = HashGuard()
 
     def _check_and_create_request(
@@ -63,7 +83,7 @@ class RequestPipeline:
             bt.logging.error(f"Hash already exists: {e}")
             safe_log({"hash_guard_error": 1})
             if request_type == RequestType.RWR:
-                self.api.set_request_result(
+                self.relay.set_request_result(
                     external_request_hash,
                     {"success": False, "error": "Hash already exists"},
                 )
@@ -71,10 +91,16 @@ class RequestPipeline:
 
         axon: AxonInfo = self.config.metagraph.axons[uid]
 
+        overrides = _get_local_miner_overrides()
+        if uid in overrides:
+            override_ip, override_port = overrides[uid]
+        else:
+            override_ip, override_port = axon.ip, axon.port
+
         request = Request(
             uid=uid,
-            ip=axon.ip,
-            port=axon.port,
+            ip=override_ip,
+            port=override_port,
             hotkey=axon.hotkey,
             coldkey=axon.coldkey,
             data=request_data.model_dump(),
@@ -97,7 +123,12 @@ class RequestPipeline:
         return request
 
     def _prepare_queued_request(self, uid: int) -> Request:
-        external_request = self.api.stacked_requests_queue.pop()
+        external_request = self.relay.stacked_requests_queue.get_nowait()
+        if hasattr(external_request, "slice_num"):
+            remaining = self.relay.stacked_requests_queue.qsize()
+            bt.logging.debug(
+                f"Popped slice_num={external_request.slice_num} (remaining: {remaining})"
+            )
         request = None
 
         try:
@@ -120,7 +151,7 @@ class RequestPipeline:
             bt.logging.error(f"Error preparing request for UID {uid}: {e}")
             traceback.print_exc()
             if external_request.request_type == RequestType.RWR:
-                self.api.set_request_result(
+                self.relay.set_request_result(
                     external_request.hash,
                     {"success": False, "error": "Error preparing request"},
                 )
