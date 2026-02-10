@@ -149,9 +149,9 @@ def capture_environment() -> dict:
 
     def get_sn2_version() -> Optional[str]:
         try:
-            from neurons import __version__
+            from utils.auto_update import get_version
 
-            return __version__
+            return get_version()
         except Exception:
             return None
 
