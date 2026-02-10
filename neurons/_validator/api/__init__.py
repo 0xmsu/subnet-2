@@ -28,8 +28,6 @@ from constants import (
     EXTERNAL_REQUEST_QUEUE_TIME_SECONDS,
     RELAY_AUTH_TIMEOUT,
     RELAY_OPEN_TIMEOUT,
-    RELAY_PING_INTERVAL,
-    RELAY_PING_TIMEOUT,
     RELAY_RECONNECT_BASE_DELAY,
     RELAY_RECONNECT_MAX_DELAY,
 )
@@ -113,8 +111,8 @@ class RelayManager:
             async with websockets.connect(
                 self.config.relay_url,
                 open_timeout=RELAY_OPEN_TIMEOUT,
-                ping_interval=RELAY_PING_INTERVAL,
-                ping_timeout=RELAY_PING_TIMEOUT,
+                ping_interval=None,
+                ping_timeout=None,
                 max_size=100 * 1024 * 1024,
             ) as ws:
                 bt.logging.debug("WebSocket handshake completed")
