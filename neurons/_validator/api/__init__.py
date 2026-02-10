@@ -234,7 +234,7 @@ class RelayManager:
         self, ws: websockets.WebSocketClientProtocol
     ) -> None:
         """Periodically flush queued notifications while connected."""
-        while self._should_run and not ws.closed:
+        while self._should_run and ws.close_code is None:
             await self._flush_pending_notifications(ws)
             await asyncio.sleep(1)
 
@@ -242,7 +242,7 @@ class RelayManager:
         self, ws: websockets.WebSocketClientProtocol
     ) -> None:
         """Send any queued notifications after reconnecting."""
-        while self._pending_notifications and not ws.closed:
+        while self._pending_notifications and ws.close_code is None:
             notification = self._pending_notifications.pop(0)
             try:
                 await ws.send(json.dumps(notification))
