@@ -113,6 +113,7 @@ class RelayManager:
                 open_timeout=RELAY_OPEN_TIMEOUT,
                 ping_interval=RELAY_PING_INTERVAL,
                 ping_timeout=RELAY_PING_TIMEOUT,
+                max_size=100 * 1024 * 1024,
             ) as ws:
                 bt.logging.debug("WebSocket handshake completed")
                 self._ws = ws
