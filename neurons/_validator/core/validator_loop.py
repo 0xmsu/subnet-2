@@ -59,7 +59,7 @@ from utils.gc_logging import log_responses as gc_log_responses
 # Set to True for synchronous request processing (easier debugging)
 DEBUG_SYNC_MODE = os.environ.get("DEBUG_SYNC_MODE", "").lower() in ("1", "true", "yes")
 
-MAX_SLICE_RETRIES = 3
+MAX_SLICE_RETRIES = 20
 
 
 class ValidatorLoop:
