@@ -19,6 +19,7 @@ import time
 from dsperse.src.backends.ezkl import EZKL
 from dsperse.src.backends.jstprove import JSTprove
 from dsperse.src.run.runner import Runner
+from dsperse.src.slice.utils.converter import Converter
 from dsperse.src.verify.verifier import Verifier
 from execution_layer.circuit import Circuit, CircuitType, ProofSystem
 import numpy as np
@@ -120,6 +121,7 @@ class DSperseManager:
             self._incremental_runner = IncrementalRunner(
                 on_run_complete=self._on_incremental_run_complete,
                 on_jstprove_range_fallback=self._on_jstprove_range_fallback,
+                on_tile_onnx_fallback=self._on_tile_onnx_fallback,
             )
         self._purge_old_runs()
 
@@ -303,6 +305,7 @@ class DSperseManager:
             self._incremental_runner = IncrementalRunner(
                 on_run_complete=self._on_incremental_run_complete,
                 on_jstprove_range_fallback=self._on_jstprove_range_fallback,
+                on_tile_onnx_fallback=self._on_tile_onnx_fallback,
             )
 
         run_uid = self._incremental_runner.start_run(circuit, inputs)
@@ -369,6 +372,7 @@ class DSperseManager:
             self._incremental_runner = IncrementalRunner(
                 on_run_complete=self._on_incremental_run_complete,
                 on_jstprove_range_fallback=self._on_jstprove_range_fallback,
+                on_tile_onnx_fallback=self._on_tile_onnx_fallback,
             )
 
         with self._incremental_runs_lock:
@@ -562,6 +566,27 @@ class DSperseManager:
                     run_uid=run_uid,
                     slice_num=slice_id,
                     overflow_info=overflow_info,
+                )
+            )
+
+    def _on_tile_onnx_fallback(
+        self, run_uid: str, slice_id: str, task_id: str, tile_idx: int
+    ) -> None:
+        logging.warning(
+            f"Tile ONNX fallback in run {run_uid} slice {slice_id}: "
+            f"task {task_id} (tile {tile_idx}) reverted to local ONNX"
+        )
+        if self.event_client:
+            slice_num = (
+                f"{slice_id.removeprefix('slice_')}_tile_{tile_idx}"
+                if tile_idx >= 0
+                else slice_id
+            )
+            self._schedule_async(
+                self.event_client.emit_tile_onnx_fallback(
+                    run_uid=run_uid,
+                    slice_num=slice_num,
+                    task_id=task_id,
                 )
             )
 
@@ -1021,7 +1046,10 @@ class DSperseManager:
         incremental_mode = outputs is None
         circuit = self._get_circuit_by_id(circuit_id)
         base_slice_num, tile_idx = self._parse_slice_num(slice_num)
-        model_dir = Path(circuit.paths.base_path) / f"slice_{base_slice_num}"
+        base_path = Path(circuit.paths.base_path)
+        slice_id = f"slice_{base_slice_num}"
+        model_dir = base_path / slice_id
+        dslice_path = base_path / f"{slice_id}.dslice"
         result = {
             "circuit_id": circuit_id,
             "slice_num": slice_num,
@@ -1029,6 +1057,18 @@ class DSperseManager:
             "proof_generation_time": None,
             "proof": None,
         }
+        if not model_dir.exists() and dslice_path.exists():
+            logging.info(f"Extracting {slice_id} from {dslice_path}")
+            try:
+                Converter.extract_single_slice(base_path, slice_id, base_path)
+            except Exception as e:
+                logging.error(f"Failed to extract {slice_id} from {dslice_path}: {e}")
+                return result
+        if not model_dir.exists():
+            logging.error(
+                f"Slice directory {model_dir} does not exist and no .dslice archive found"
+            )
+            return result
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
