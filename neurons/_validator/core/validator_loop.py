@@ -118,7 +118,7 @@ class ValidatorLoop:
         self.request_queue = asyncio.Queue()
         self.active_tasks: dict[str, asyncio.Task | None] = {}
         self.miner_active_count: dict[int, int] = {}
-        self.default_miner_capacity = 10
+        self.default_miner_capacity = 1
         self.queryable_uids: list[int] = []
         self.last_response_time = time.time()
         self.last_periodic_task_time = time.time()
