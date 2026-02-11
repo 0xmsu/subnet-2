@@ -30,6 +30,7 @@ from constants import (
     RELAY_OPEN_TIMEOUT,
     RELAY_RECONNECT_BASE_DELAY,
     RELAY_RECONNECT_MAX_DELAY,
+    RunSource,
 )
 
 
@@ -403,11 +404,14 @@ class RelayManager:
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 
+            self.dsperse_manager.abort_benchmark_runs()
+
             run_uid, requests = await asyncio.to_thread(
                 self.dsperse_manager.start_run,
                 circuit,
                 inputs,
                 callback=self._on_run_complete,
+                run_source=RunSource.API,
             )
 
             for request in requests:
