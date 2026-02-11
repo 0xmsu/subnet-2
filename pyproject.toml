@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subnet-2"
-dynamic = ["version"]
+version = "0.0.0"
 description = ""
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -61,8 +61,6 @@ dev = [
 package-dir = { "subnet-2" = "neurons" }
 packages = ["subnet-2"]
 
-[tool.setuptools.dynamic]
-version = { attr = "neurons.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

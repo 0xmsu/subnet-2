@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import json
 import traceback
 from pathlib import Path
@@ -22,12 +23,11 @@ from websockets.exceptions import ConnectionClosed
 
 from _validator.config import ValidatorConfig
 from _validator.models.poc_rpc_request import ProofOfComputationRPCRequest
+from _validator.models.request_type import RequestType
 from constants import (
     EXTERNAL_REQUEST_QUEUE_TIME_SECONDS,
     RELAY_AUTH_TIMEOUT,
     RELAY_OPEN_TIMEOUT,
-    RELAY_PING_INTERVAL,
-    RELAY_PING_TIMEOUT,
     RELAY_RECONNECT_BASE_DELAY,
     RELAY_RECONNECT_MAX_DELAY,
 )
@@ -52,6 +52,7 @@ class RelayManager:
         self.config = config
         # Queue of requests to be sent to miners (consumed by ValidatorLoop)
         self.stacked_requests_queue: asyncio.Queue = asyncio.Queue()
+        self.rwr_queue: asyncio.Queue = asyncio.Queue()
         self.pending_requests: dict[str, asyncio.Event] = {}
         self.request_results: dict[str, dict] = {}
         self.is_testnet = config.bt_config.subtensor.network == "test"
@@ -110,8 +111,9 @@ class RelayManager:
             async with websockets.connect(
                 self.config.relay_url,
                 open_timeout=RELAY_OPEN_TIMEOUT,
-                ping_interval=RELAY_PING_INTERVAL,
-                ping_timeout=RELAY_PING_TIMEOUT,
+                ping_interval=None,
+                ping_timeout=None,
+                max_size=100 * 1024 * 1024,
             ) as ws:
                 bt.logging.debug("WebSocket handshake completed")
                 self._ws = ws
@@ -233,7 +235,7 @@ class RelayManager:
         self, ws: websockets.WebSocketClientProtocol
     ) -> None:
         """Periodically flush queued notifications while connected."""
-        while self._should_run and not ws.closed:
+        while self._should_run and ws.close_code is None:
             await self._flush_pending_notifications(ws)
             await asyncio.sleep(1)
 
@@ -241,7 +243,7 @@ class RelayManager:
         self, ws: websockets.WebSocketClientProtocol
     ) -> None:
         """Send any queued notifications after reconnecting."""
-        while self._pending_notifications and not ws.closed:
+        while self._pending_notifications and ws.close_code is None:
             notification = self._pending_notifications.pop(0)
             try:
                 await ws.send(json.dumps(notification))
@@ -329,8 +331,19 @@ class RelayManager:
                 )
                 return InvalidParams(str(e))
 
+            if external_request.circuit.metadata.input_schema:
+                try:
+                    external_request.circuit.input_handler(
+                        RequestType.RWR, copy.deepcopy(external_request.inputs)
+                    )
+                except (ValueError, TypeError) as e:
+                    bt.logging.warning(
+                        f"Input validation failed for circuit {circuit_id}: {e}"
+                    )
+                    return InvalidParams(f"Invalid input shape: {e}")
+
             self.pending_requests[external_request.hash] = asyncio.Event()
-            self.stacked_requests_queue.put_nowait(external_request)
+            self.rwr_queue.put_nowait(external_request)
             bt.logging.success(
                 f"External request with hash {external_request.hash} added to queue"
             )
@@ -378,6 +391,15 @@ class RelayManager:
             circuit = circuit_store.ensure_circuit(circuit_id)
             if not self.dsperse_manager:
                 return Error(10, "DSperse manager not initialized")
+
+            if circuit.metadata.input_schema:
+                try:
+                    circuit.input_handler(RequestType.RWR, copy.deepcopy(inputs))
+                except (ValueError, TypeError) as e:
+                    bt.logging.warning(
+                        f"Input validation failed for circuit {circuit_id}: {e}"
+                    )
+                    return InvalidParams(f"Invalid input shape: {e}")
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 

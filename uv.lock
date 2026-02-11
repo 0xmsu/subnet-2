@@ -2669,6 +2669,7 @@ wheels = [
 
 [[package]]
 name = "subnet-2"
+version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

@@ -114,6 +114,7 @@ class DSperseManager:
         self.incremental_mode = incremental_mode
         self._incremental_runner: IncrementalRunner | None = None
         self._incremental_runs: set[str] = set()
+        self._incremental_run_circuits: dict[str, str] = {}
         self._incremental_runs_lock = threading.Lock()
         if incremental_mode:
             self._incremental_runner = IncrementalRunner(
@@ -239,14 +240,23 @@ class DSperseManager:
 
         logging.info(f"Generated {len(requests)} DSlice requests for run {run_uid}")
 
+        total_tiles = len(slice_data_list)
+        slice_tile_counts: dict[str, int] = {}
+        for s in slice_data_list:
+            parent = f"slice_{s.slice_num.split('_tile_')[0]}"
+            slice_tile_counts[parent] = slice_tile_counts.get(parent, 0) + 1
+        total_slices = len(slice_tile_counts)
+
         if self.event_client:
             self._schedule_async(
                 self.event_client.emit_run_started(
                     run_uid=run_uid,
                     circuit_id=circuit.id,
                     circuit_name=circuit.metadata.name,
-                    total_slices=len(slice_data_list),
+                    total_slices=total_slices,
                     environment=environment,
+                    total_tiles=total_tiles,
+                    slice_tile_counts=slice_tile_counts,
                 )
             )
             for slice_data in slice_data_list:
@@ -298,6 +308,7 @@ class DSperseManager:
         run_uid = self._incremental_runner.start_run(circuit, inputs)
         with self._incremental_runs_lock:
             self._incremental_runs.add(run_uid)
+            self._incremental_run_circuits[run_uid] = circuit.id
 
         if self.event_client:
             status = self._incremental_runner.get_run_status(run_uid)
@@ -308,6 +319,8 @@ class DSperseManager:
                     circuit_name=circuit.metadata.name,
                     total_slices=status["total_slices"] if status else 0,
                     environment=capture_environment(),
+                    total_tiles=status["total_tiles"] if status else 0,
+                    slice_tile_counts=status["slice_tile_counts"] if status else None,
                 )
             )
 
@@ -360,6 +373,7 @@ class DSperseManager:
 
         with self._incremental_runs_lock:
             incremental_runs_snapshot = list(self._incremental_runs)
+            active_circuit_ids = set(self._incremental_run_circuits.values())
 
         for run_uid in incremental_runs_snapshot:
             if not self._incremental_runner.is_complete(run_uid):
@@ -370,9 +384,12 @@ class DSperseManager:
                     )
                     return requests
 
-        if not self.circuits:
+        available_circuits = [
+            c for c in self.circuits if c.id not in active_circuit_ids
+        ]
+        if not available_circuits:
             return []
-        circuit = random.choice(self.circuits)
+        circuit = random.choice(available_circuits)
         run_uid = self.start_incremental_run(circuit)
 
         requests = self.get_next_incremental_work(run_uid)
@@ -554,6 +571,7 @@ class DSperseManager:
 
         with self._incremental_runs_lock:
             self._incremental_runs.discard(run_uid)
+            self._incremental_run_circuits.pop(run_uid, None)
 
             if self.event_client:
                 status = (

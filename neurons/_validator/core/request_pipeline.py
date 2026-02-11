@@ -11,6 +11,7 @@ from bittensor.core.chain_data import AxonInfo
 from _validator.api import RelayManager
 from _validator.config import ValidatorConfig
 from _validator.core.request import Request
+from _validator.models.base_rpc_request import QueuedRequestDataModel
 from _validator.models.request_type import RequestType
 from _validator.pow.proof_of_weights_handler import ProofOfWeightsHandler
 from _validator.scoring.score_manager import ScoreManager
@@ -122,8 +123,12 @@ class RequestPipeline:
 
         return request
 
-    def _prepare_queued_request(self, uid: int) -> Request:
-        external_request = self.relay.stacked_requests_queue.get_nowait()
+    def _prepare_queued_request(
+        self, uid: int, queued_request: QueuedRequestDataModel | None = None
+    ) -> Request | None:
+        external_request = (
+            queued_request or self.relay.stacked_requests_queue.get_nowait()
+        )
         if hasattr(external_request, "slice_num"):
             remaining = self.relay.stacked_requests_queue.qsize()
             bt.logging.debug(
@@ -159,7 +164,7 @@ class RequestPipeline:
 
     def _prepare_benchmark_request(
         self, uid: int, circuit: Circuit | None = None
-    ) -> Request:
+    ) -> Request | None:
         circuit = circuit or self.select_circuit_for_benchmark()
         if circuit is None:
             bt.logging.error("No circuit selected")

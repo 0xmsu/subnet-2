@@ -46,6 +46,7 @@ from constants import (
     DEFAULT_PROOF_SIZE,
     EXCEPTION_DELAY_SECONDS,
     FIVE_MINUTES,
+    IDLE_BENCHMARK_PROBABILITY,
     LOOP_DELAY_SECONDS,
     MAX_CONCURRENT_REQUESTS,
     ONE_HOUR,
@@ -58,7 +59,7 @@ from utils.gc_logging import log_responses as gc_log_responses
 # Set to True for synchronous request processing (easier debugging)
 DEBUG_SYNC_MODE = os.environ.get("DEBUG_SYNC_MODE", "").lower() in ("1", "true", "yes")
 
-MAX_SLICE_RETRIES = 3
+MAX_SLICE_RETRIES = 20
 
 
 class ValidatorLoop:
@@ -264,10 +265,7 @@ class ValidatorLoop:
                     await asyncio.sleep(1)
                     continue
 
-                if (
-                    self.relay.stacked_requests_queue.empty()
-                    and not self.dsperse_manager.has_work_in_flight()
-                ):
+                if self.relay.stacked_requests_queue.empty():
                     new_requests = list(self.dsperse_manager.generate_dslice_requests())
                     if new_requests:
                         bt.logging.info(
@@ -311,12 +309,19 @@ class ValidatorLoop:
                                 uid,
                                 pow_circuit,
                             )
+                        elif not self.relay.rwr_queue.empty():
+                            rwr_req = self.relay.rwr_queue.get_nowait()
+                            request = self.request_pipeline._prepare_queued_request(
+                                uid, rwr_req
+                            )
                         elif not self.relay.stacked_requests_queue.empty():
                             request = self.request_pipeline._prepare_queued_request(uid)
-                        else:
+                        elif random.random() < IDLE_BENCHMARK_PROBABILITY:
                             request = self.request_pipeline._prepare_benchmark_request(
                                 uid
                             )
+                        else:
+                            break
 
                         if not request:
                             bt.logging.warning(
@@ -569,7 +574,10 @@ class ValidatorLoop:
         )
 
         self.request_pipeline.hash_guard.remove_hash(request.guard_hash)
-        self.relay.stacked_requests_queue.put_nowait(queued)
+        if request.request_type == RequestType.RWR:
+            self.relay.rwr_queue.put_nowait(queued)
+        else:
+            self.relay.stacked_requests_queue.put_nowait(queued)
 
     def _mark_dslice_failed(self, queued: DSliceQueuedProofRequest) -> None:
         if getattr(queued, "is_tile", False):

@@ -39,11 +39,11 @@ IGNORED_MODEL_HASHES = [
 # The maximum timespan allowed for miners to respond to a query
 VALIDATOR_REQUEST_TIMEOUT_SECONDS = 120
 # The maximum timespan allowed for miners to process through a circuit
-CIRCUIT_TIMEOUT_SECONDS = 60
+CIRCUIT_TIMEOUT_SECONDS = 180
 # An additional queueing time for external requests
 EXTERNAL_REQUEST_QUEUE_TIME_SECONDS = 10
 # Maximum number of concurrent requests that the validator will handle
-MAX_CONCURRENT_REQUESTS = 128
+MAX_CONCURRENT_REQUESTS = 32
 # Default proof size when we're unable to determine the actual size
 DEFAULT_PROOF_SIZE = 5000
 # Size in percent of the sample to be used for the maximum score median
@@ -171,6 +171,8 @@ MAX_EVALUATION_ITEMS = 1024
 
 # Maximum circuit size in GB for competitions
 MAX_CIRCUIT_SIZE_GB = 50
+# Probability of issuing a circom benchmark when all queues are empty
+IDLE_BENCHMARK_PROBABILITY = 0.1
 # EMA boost factor
 EMA_BOOST_FACTOR = 1.2
 # EMA enabled flag
@@ -194,5 +196,5 @@ RELAY_RECONNECT_BASE_DELAY = 1  # seconds
 RELAY_RECONNECT_MAX_DELAY = 60  # seconds
 RELAY_AUTH_TIMEOUT = 10  # seconds
 RELAY_OPEN_TIMEOUT = 20  # seconds
-RELAY_PING_INTERVAL = 20  # seconds
-RELAY_PING_TIMEOUT = 20  # seconds
+RELAY_PING_INTERVAL = 30  # seconds
+RELAY_PING_TIMEOUT = 120  # seconds
