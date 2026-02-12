@@ -71,6 +71,22 @@ class DSperseManager:
         ) = None
         self._purge_old_runs()
 
+    @staticmethod
+    def _ensure_slice_extracted(base_path: Path, slice_id: str) -> bool:
+        slice_dir = base_path / slice_id
+        if slice_dir.exists():
+            return True
+        dslice_path = base_path / f"{slice_id}.dslice"
+        if not dslice_path.exists():
+            return False
+        logging.info(f"Extracting {slice_id} from {dslice_path}")
+        try:
+            Converter.extract_single_slice(base_path, slice_id, base_path)
+            return True
+        except Exception as e:
+            logging.error(f"Failed to extract {slice_id} from {dslice_path}: {e}")
+            return False
+
     @property
     def circuits(self) -> list[Circuit]:
         return [
@@ -707,7 +723,6 @@ class DSperseManager:
         base_path = Path(circuit.paths.base_path)
         slice_id = f"slice_{base_slice_num}"
         model_dir = base_path / slice_id
-        dslice_path = base_path / f"{slice_id}.dslice"
         result = {
             "circuit_id": circuit_id,
             "slice_num": slice_num,
@@ -715,14 +730,7 @@ class DSperseManager:
             "proof_generation_time": None,
             "proof": None,
         }
-        if not model_dir.exists() and dslice_path.exists():
-            logging.info(f"Extracting {slice_id} from {dslice_path}")
-            try:
-                Converter.extract_single_slice(base_path, slice_id, base_path)
-            except Exception as e:
-                logging.error(f"Failed to extract {slice_id} from {dslice_path}: {e}")
-                return result
-        if not model_dir.exists():
+        if not self._ensure_slice_extracted(base_path, slice_id):
             logging.error(
                 f"Slice directory {model_dir} does not exist and no .dslice archive found"
             )
@@ -929,12 +937,15 @@ class DSperseManager:
 
         circuit = self._get_circuit_by_id(circuit_id)
         base_slice_num, tile_idx = self._parse_slice_num(slice_num)
-        slice_dir = Path(circuit.paths.base_path) / f"slice_{base_slice_num}"
+        base_path = Path(circuit.paths.base_path)
+        slice_id = f"slice_{base_slice_num}"
+        slice_dir = base_path / slice_id
         metadata_path = slice_dir / "metadata.json"
 
         if not metadata_path.exists():
-            logging.error(f"Slice metadata not found: {metadata_path}")
-            return False, None
+            if not self._ensure_slice_extracted(base_path, slice_id):
+                logging.error(f"Slice metadata not found: {metadata_path}")
+                return False, None
 
         with open(metadata_path, "r") as f:
             slice_metadata = json.load(f)
