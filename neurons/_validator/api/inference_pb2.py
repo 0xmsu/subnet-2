@@ -19,7 +19,7 @@ _sym_db = _symbol_database.Default()
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n\x0finference.proto"7\n\x10InferenceRequest\x12\x10\n\x04\x64\x61ta\x18\x01 \x03(\x02\x42\x02\x10\x01\x12\x11\n\x05shape\x18\x02 \x03(\x05\x42\x02\x10\x01\x62\x06proto3'
+    b'\n\x0finference.proto\x12\x07subnet2"7\n\x10InferenceRequest\x12\x10\n\x04\x64\x61ta\x18\x01 \x03(\x02\x42\x02\x10\x01\x12\x11\n\x05shape\x18\x02 \x03(\x05\x42\x02\x10\x01\x62\x06proto3'
 )
 
 _globals = globals()
@@ -35,6 +35,6 @@ if not _descriptor._USE_C_DESCRIPTORS:
     _globals["_INFERENCEREQUEST"].fields_by_name[
         "shape"
     ]._serialized_options = b"\020\001"
-    _globals["_INFERENCEREQUEST"]._serialized_start = 19
-    _globals["_INFERENCEREQUEST"]._serialized_end = 74
+    _globals["_INFERENCEREQUEST"]._serialized_start = 28
+    _globals["_INFERENCEREQUEST"]._serialized_end = 83
 # @@protoc_insertion_point(module_scope)

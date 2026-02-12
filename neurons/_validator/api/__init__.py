@@ -47,23 +47,29 @@ def _decode_protobuf_input(data: bytes) -> np.ndarray:
     return np.array(msg.data, dtype=np.float32).reshape(msg.shape)
 
 
+_spawn_ctx = mp.get_context("spawn")
+
+
 def _onnx_inference_worker(
     model_path: str, input_data, run_uid: str, result_queue: mp.Queue
 ):
-    if isinstance(input_data, np.ndarray):
-        arr = (
-            input_data.astype(np.float32)
-            if input_data.dtype != np.float32
-            else input_data
-        )
-    else:
-        arr = np.array(input_data, dtype=np.float32)
-    if arr.ndim == 3:
-        arr = np.expand_dims(arr, 0)
-    sess = ort.InferenceSession(model_path)
-    input_name = sess.get_inputs()[0].name
-    result = sess.run(None, {input_name: arr})
-    result_queue.put((run_uid, result[0].tolist()))
+    try:
+        if isinstance(input_data, np.ndarray):
+            arr = (
+                input_data.astype(np.float32)
+                if input_data.dtype != np.float32
+                else input_data
+            )
+        else:
+            arr = np.array(input_data, dtype=np.float32)
+        if arr.ndim == 3:
+            arr = np.expand_dims(arr, 0)
+        sess = ort.InferenceSession(model_path)
+        input_name = sess.get_inputs()[0].name
+        result = sess.run(None, {input_name: arr})
+        result_queue.put((run_uid, result[0].tolist()))
+    except Exception as exc:
+        result_queue.put((run_uid, None, str(exc)))
 
 
 class AuthenticationError(Exception):
@@ -92,7 +98,8 @@ class RelayManager:
         self.dispatch_event: asyncio.Event | None = None
         self._onnx_outputs: dict[str, list] = {}
         self._onnx_lock = threading.Lock()
-        self._onnx_result_queue: mp.Queue = mp.Queue()
+        self._onnx_result_queue: mp.Queue = _spawn_ctx.Queue()
+        self._onnx_processes: dict[str, mp.Process] = {}
         self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
@@ -107,10 +114,18 @@ class RelayManager:
     def _monitor_onnx_results(self) -> None:
         while True:
             try:
-                run_uid, output = self._onnx_result_queue.get()
-                with self._onnx_lock:
-                    self._onnx_outputs[run_uid] = output
-                bt.logging.info(f"Full-model ONNX complete for run {run_uid}")
+                msg = self._onnx_result_queue.get()
+                if len(msg) == 3:
+                    run_uid, _, err = msg
+                    bt.logging.warning(
+                        f"Full-model ONNX failed for run {run_uid}: {err}"
+                    )
+                else:
+                    run_uid, output = msg
+                    with self._onnx_lock:
+                        self._onnx_outputs[run_uid] = output
+                    bt.logging.info(f"Full-model ONNX complete for run {run_uid}")
+                self._onnx_processes.pop(run_uid, None)
             except Exception as e:
                 bt.logging.warning(f"ONNX result monitor error: {e}")
 
@@ -427,12 +442,13 @@ class RelayManager:
         input_data = inputs.get("input_data")
         if input_data is None:
             return
-        p = mp.Process(
+        p = _spawn_ctx.Process(
             target=_onnx_inference_worker,
             args=(model_path, input_data, run_uid, self._onnx_result_queue),
             daemon=True,
         )
         p.start()
+        self._onnx_processes[run_uid] = p
 
     async def handle_dsperse_submit(self, **params: object) -> dict[str, object]:
         circuit_id = params.get("circuit_id")
@@ -563,6 +579,9 @@ class RelayManager:
     def _cleanup_run(self, run_uid: str) -> None:
         with self._onnx_lock:
             self._onnx_outputs.pop(run_uid, None)
+        proc = self._onnx_processes.pop(run_uid, None)
+        if proc and proc.is_alive():
+            proc.kill()
         if self.dsperse_manager:
             try:
                 self.dsperse_manager.cleanup_run(run_uid)
