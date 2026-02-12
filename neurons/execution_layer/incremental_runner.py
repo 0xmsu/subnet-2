@@ -29,9 +29,54 @@ from dsperse.src.analyzers.schema import (
 from dsperse.src.run.runner import Runner as DsperseRunner
 from dsperse.src.run.tile_executor import TileExecutor
 from dsperse.src.slice.utils.converter import Converter
+from constants import RunSource
 from execution_layer.circuit import Circuit, ProofSystem
 from _validator.models.dslice_request import DSliceQueuedProofRequest
 from _validator.models.request_type import RequestType
+
+
+@dataclass
+class RunStatus:
+    run_uid: str
+    circuit_name: str
+    total_slices: int
+    total_tiles: int
+    slice_tile_counts: dict[str, int]
+    current_slice: Optional[str]
+    completed: int
+    failed: int
+    pending_work: int
+    is_complete: bool
+    elapsed_time: float
+    aborted: bool = False
+
+    @property
+    def all_successful(self) -> bool:
+        return self.is_complete and self.failed == 0 and not self.aborted
+
+    @property
+    def progress_percent(self) -> float:
+        if self.total_slices == 0:
+            return 0.0
+        return (self.completed + self.failed) / self.total_slices * 100
+
+    def to_dict(self) -> dict:
+        return {
+            "run_uid": self.run_uid,
+            "circuit_name": self.circuit_name,
+            "total_slices": self.total_slices,
+            "total_tiles": self.total_tiles,
+            "slice_tile_counts": self.slice_tile_counts,
+            "current_slice": self.current_slice,
+            "completed": self.completed,
+            "failed": self.failed,
+            "pending_work": self.pending_work,
+            "is_complete": self.is_complete,
+            "elapsed_time": self.elapsed_time,
+            "aborted": self.aborted,
+            "all_successful": self.all_successful,
+            "progress_percent": self.progress_percent,
+        }
 
 
 @dataclass
@@ -64,6 +109,8 @@ class RunState:
     completed_slices: list[str] = field(default_factory=list)
     failed_slices: list[str] = field(default_factory=list)
     failed_tasks: set[str] = field(default_factory=set)
+    onnx_fallback_tasks: set[str] = field(default_factory=set)
+    run_source: RunSource = RunSource.BENCHMARK
     start_time: float = 0.0
     aborted: bool = False
 
@@ -109,10 +156,12 @@ class IncrementalRunner:
         self,
         on_run_complete: Optional[Callable[[str, bool], None]] = None,
         on_jstprove_range_fallback: Optional[Callable[[str, str, dict], None]] = None,
+        on_tile_onnx_fallback: Optional[Callable[[str, str, str, int], None]] = None,
     ):
         self._runs: dict[str, RunState] = {}
         self._on_run_complete = on_run_complete
         self._on_jstprove_range_fallback = on_jstprove_range_fallback
+        self._on_tile_onnx_fallback = on_tile_onnx_fallback
 
     def _build_from_dslice_zips(
         self, slices_path: Path, dslice_files: list[Path]
@@ -145,7 +194,12 @@ class IncrementalRunner:
         )
         return run_meta.to_dict()
 
-    def start_run(self, circuit: Circuit, inputs: Optional[dict] = None) -> str:
+    def start_run(
+        self,
+        circuit: Circuit,
+        inputs: Optional[dict] = None,
+        run_source: RunSource = RunSource.BENCHMARK,
+    ) -> str:
         """Start a new incremental run."""
         run_uid = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{secrets.token_hex(8)}"
         logging.info(f"Starting incremental run {run_uid} for {circuit.metadata.name}")
@@ -215,6 +269,7 @@ class IncrementalRunner:
             tensor_cache=tensor_cache,
             execution_order=execution_order,
             slice_metadata={k: v for k, v in run_metadata.slices.items()},
+            run_source=run_source,
             start_time=time.perf_counter(),
         )
 
@@ -337,16 +392,29 @@ class IncrementalRunner:
         del state.pending_work[task_id]
 
         if not success:
-            logging.error(f"Task {task_id} failed: {error}")
-            state.failed_tasks.add(task_id)
-            if not state.pending_work:
-                state.failed_slices.append(state.current_slice_id)
-                state.aborted = True
-                logging.error(
-                    f"Run {run_uid} aborted: slice {state.current_slice_id} failed"
-                )
-                self._on_complete(state)
-            return not state.pending_work
+            logging.warning(f"Task {task_id} failed from miner: {error}")
+            try:
+                self._run_onnx_for_failed_task(state, task_id)
+                state.onnx_fallback_tasks.add(task_id)
+                logging.warning(f"ONNX fallback succeeded for {task_id}")
+                if self._on_tile_onnx_fallback:
+                    tile_idx = (
+                        int(task_id.split("_tile_")[1]) if "_tile_" in task_id else -1
+                    )
+                    self._on_tile_onnx_fallback(
+                        run_uid, state.current_slice_id, task_id, tile_idx
+                    )
+            except Exception as onnx_err:
+                logging.error(f"ONNX fallback also failed for {task_id}: {onnx_err}")
+                state.failed_tasks.add(task_id)
+                if not state.pending_work:
+                    state.failed_slices.append(state.current_slice_id)
+                    state.aborted = True
+                    logging.error(
+                        f"Run {run_uid} aborted: slice {state.current_slice_id} failed"
+                    )
+                    self._on_complete(state)
+                return not state.pending_work
 
         slice_id = state.current_slice_id
         meta = state.slice_metadata.get(slice_id)
@@ -388,24 +456,24 @@ class IncrementalRunner:
 
         return False
 
-    def get_run_status(self, run_uid: str) -> Optional[dict]:
-        """Get run status."""
+    def get_run_status(self, run_uid: str) -> Optional[RunStatus]:
         if run_uid not in self._runs:
             return None
         state = self._runs[run_uid]
-        return {
-            "run_uid": run_uid,
-            "circuit_name": state.circuit.metadata.name,
-            "total_slices": len(state.execution_order),
-            "total_tiles": state.total_tiles,
-            "slice_tile_counts": state.slice_tile_counts,
-            "current_slice": state.current_slice_id,
-            "completed": len(state.completed_slices),
-            "failed": len(state.failed_slices),
-            "pending_work": len(state.pending_work),
-            "is_complete": state.is_complete,
-            "elapsed_time": time.perf_counter() - state.start_time,
-        }
+        return RunStatus(
+            run_uid=run_uid,
+            circuit_name=state.circuit.metadata.name,
+            total_slices=len(state.execution_order),
+            total_tiles=state.total_tiles,
+            slice_tile_counts=state.slice_tile_counts,
+            current_slice=state.current_slice_id,
+            completed=len(state.completed_slices),
+            failed=len(state.failed_slices),
+            pending_work=len(state.pending_work),
+            is_complete=state.is_complete,
+            elapsed_time=time.perf_counter() - state.start_time,
+            aborted=state.aborted,
+        )
 
     def get_final_output(self, run_uid: str) -> Optional[Any]:
         """Get final output tensor."""
@@ -439,6 +507,21 @@ class IncrementalRunner:
         if run_uid not in self._runs:
             return False
         return self._runs[run_uid].is_waiting
+
+    def abort_run(self, run_uid: str) -> None:
+        if run_uid not in self._runs:
+            return
+        state = self._runs[run_uid]
+        if state.aborted or state.is_complete:
+            return
+        state.aborted = True
+        logging.warning(f"Run {run_uid} aborted (preempted)")
+        self._on_complete(state)
+
+    def get_run_source(self, run_uid: str) -> RunSource | None:
+        if run_uid not in self._runs:
+            return None
+        return self._runs[run_uid].run_source
 
     def cleanup_run(self, run_uid: str) -> None:
         """Clean up run state."""
@@ -562,6 +645,58 @@ class IncrementalRunner:
                     "circuit_id": state.circuit.id,
                 }
         return None
+
+    def _run_onnx_for_failed_task(
+        self, state: RunState, task_id: str
+    ) -> Optional[torch.Tensor]:
+        from dsperse.src.run.utils.runner_utils import RunnerUtils
+        from dsperse.src.backends.onnx_models import OnnxModels
+
+        slice_id = state.current_slice_id
+        meta = state.slice_metadata.get(slice_id)
+        if not meta:
+            raise ValueError(f"No metadata for {slice_id}")
+
+        if "_tile_" in task_id:
+            if not meta.tiling:
+                raise ValueError(f"Missing tiling metadata for slice {slice_id}")
+            tile_idx = int(task_id.split("_tile_")[1])
+            cache_name = f"tile_{meta.tiling.slice_idx}_{tile_idx}_in"
+            tile_input = state.tensor_cache.get(cache_name)
+            if tile_input is None:
+                raise ValueError(f"Missing tile input {cache_name} for ONNX fallback")
+
+            onnx_path = RunnerUtils.resolve_relative_path(
+                meta.path, state.slices_path / slice_id
+            )
+            if not onnx_path or not Path(onnx_path).exists():
+                raise ValueError(f"ONNX path not found for {slice_id}: {onnx_path}")
+
+            logging.warning(f"Running ONNX fallback for tile {task_id}")
+            success, result = OnnxModels.run_inference_tensor(
+                input_tensor=tile_input,
+                model_path=onnx_path,
+            )
+            if not success:
+                raise RuntimeError(
+                    f"ONNX inference failed for tile {task_id}: {result}"
+                )
+
+            output_tensors = result.get("output_tensors", {})
+            if output_tensors:
+                output_tensor = next(iter(output_tensors.values()))
+            else:
+                output_tensor = RunnerUtils.extract_output_tensor(result)
+
+            if output_tensor is None:
+                raise RuntimeError(f"No output tensor from ONNX fallback for {task_id}")
+
+            self._store_tile_output(state, meta, tile_idx, output_tensor)
+            return output_tensor
+        else:
+            logging.warning(f"Running ONNX fallback for slice {task_id}")
+            self._run_single_onnx(state, slice_id, meta)
+            return None
 
     def _run_onnx_locally(
         self, state: RunState, slice_id: str, meta: RunSliceMetadata
@@ -766,13 +901,12 @@ class IncrementalRunner:
             )
 
     def _on_complete(self, state: RunState) -> None:
-        """Handle run completion."""
         elapsed = time.perf_counter() - state.start_time
-        success = len(state.failed_slices) == 0
+        success = len(state.failed_slices) == 0 and not state.aborted
         logging.info(
             f"Run {state.run_uid} complete. "
             f"Completed: {len(state.completed_slices)}, Failed: {len(state.failed_slices)}, "
-            f"Time: {elapsed:.2f}s"
+            f"Aborted: {state.aborted}, Time: {elapsed:.2f}s"
         )
         if self._on_run_complete:
             self._on_run_complete(state.run_uid, success)

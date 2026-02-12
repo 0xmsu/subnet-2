@@ -67,6 +67,7 @@ class DsperseEventClient:
         environment: dict | None,
         total_tiles: int | None = None,
         slice_tile_counts: dict[str, int] | None = None,
+        run_source: str | None = None,
     ):
         await self.emit(
             {
@@ -78,6 +79,7 @@ class DsperseEventClient:
                 "total_tiles": total_tiles,
                 "slice_tile_counts": slice_tile_counts,
                 "environment": environment,
+                "run_source": run_source,
             }
         )
 
@@ -165,6 +167,22 @@ class DsperseEventClient:
                 "max_abs": overflow_info.get("max_abs"),
                 "n_bits_limit": overflow_info.get("n_bits"),
                 "fallback": "onnx",
+            }
+        )
+
+    async def emit_tile_onnx_fallback(
+        self,
+        run_uid: str,
+        slice_num: str,
+        task_id: str,
+    ):
+        await self.emit(
+            {
+                "event_type": "tile_onnx_fallback",
+                "run_uid": run_uid,
+                "slice_num": slice_num,
+                "fallback": "onnx",
+                "error": f"Miner failed task {task_id}, reverted to local ONNX",
             }
         )
 

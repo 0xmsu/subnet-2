@@ -1,8 +1,18 @@
 from __future__ import annotations
+from collections import deque
 from dataclasses import dataclass, field
+import json
+import os
+import threading
 import torch
 import bittensor as bt
 from constants import (
+    CIRCUIT_TIMEOUT_SECONDS,
+    PERFORMANCE_CURVE_POWER,
+    PERFORMANCE_MIN_SAMPLES,
+    PERFORMANCE_RESCHEDULE_PENALTY,
+    PERFORMANCE_RESPONSE_TIME_WEIGHT,
+    PERFORMANCE_WINDOW_SIZE,
     WEIGHT_RATE_LIMIT,
     WEIGHTS_VERSION,
     ONE_MINUTE,
@@ -14,6 +24,125 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from _validator.scoring.score_manager import ScoreManager
+
+
+class PerformanceTracker:
+    RESPONSE_TIME_PERCENTILE = 0.95
+
+    def __init__(
+        self,
+        window_size: int = PERFORMANCE_WINDOW_SIZE,
+        persistence_path: str | None = None,
+    ):
+        self.window_size = window_size
+        self.windows: dict[int, deque[tuple[bool, float]]] = {}
+        self._lock = threading.Lock()
+        self.persistence_path = persistence_path
+        self._load()
+
+    def _reference_time(self) -> float:
+        times = []
+        for w in self.windows.values():
+            for success, rt in w:
+                if success and rt > 0:
+                    times.append(rt)
+        if not times:
+            return CIRCUIT_TIMEOUT_SECONDS
+        times.sort()
+        idx = min(int(len(times) * self.RESPONSE_TIME_PERCENTILE), len(times) - 1)
+        return max(times[idx], 1.0)
+
+    def _score(self, success: bool, response_time_sec: float, ref: float) -> float:
+        if not success:
+            return 0.0
+        time_factor = max(0.0, 1.0 - (response_time_sec / ref))
+        return PERFORMANCE_RESPONSE_TIME_WEIGHT * time_factor + (
+            1.0 - PERFORMANCE_RESPONSE_TIME_WEIGHT
+        )
+
+    def record(
+        self,
+        uid: int,
+        success: bool,
+        response_time_sec: float = 0.0,
+    ) -> None:
+        with self._lock:
+            if uid not in self.windows:
+                self.windows[uid] = deque(maxlen=self.window_size)
+            self.windows[uid].append((success, response_time_sec))
+
+    def record_reschedule(self, uid: int) -> None:
+        with self._lock:
+            if uid not in self.windows:
+                self.windows[uid] = deque(maxlen=self.window_size)
+            self.windows[uid].append((False, PERFORMANCE_RESCHEDULE_PENALTY))
+
+    def _uid_rate(self, w: deque[tuple[bool, float]], ref: float) -> float:
+        if not w:
+            return 0.0
+        total = 0.0
+        for success, rt in w:
+            if rt == PERFORMANCE_RESCHEDULE_PENALTY:
+                total += PERFORMANCE_RESCHEDULE_PENALTY
+            else:
+                total += self._score(success, rt, ref)
+        return max(0.0, total / len(w))
+
+    def success_rate(self, uid: int) -> float:
+        with self._lock:
+            if uid not in self.windows or len(self.windows[uid]) == 0:
+                return 0.0
+            ref = self._reference_time()
+            return self._uid_rate(self.windows[uid], ref)
+
+    def sample_count(self, uid: int) -> int:
+        with self._lock:
+            if uid not in self.windows:
+                return 0
+            return len(self.windows[uid])
+
+    def snapshot(self) -> dict[int, tuple[float, int]]:
+        with self._lock:
+            ref = self._reference_time()
+            return {
+                uid: (self._uid_rate(w, ref), len(w)) for uid, w in self.windows.items()
+            }
+
+    def save(self) -> None:
+        if not self.persistence_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.persistence_path), exist_ok=True)
+            with self._lock:
+                data = {
+                    str(uid): [[s, rt] for s, rt in window]
+                    for uid, window in self.windows.items()
+                }
+            tmp_path = self.persistence_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, self.persistence_path)
+        except Exception as e:
+            bt.logging.error(f"Failed to save performance tracker: {e}")
+
+    def _load(self) -> None:
+        if not self.persistence_path or not os.path.exists(self.persistence_path):
+            return
+        try:
+            with open(self.persistence_path, "r") as f:
+                data = json.load(f)
+            for uid_str, results in data.items():
+                entries = []
+                for v in results:
+                    if isinstance(v, list) and len(v) == 2:
+                        entries.append((bool(v[0]), float(v[1])))
+                    else:
+                        score = float(v)
+                        entries.append((score > 0, 0.0))
+                self.windows[int(uid_str)] = deque(entries, maxlen=self.window_size)
+            bt.logging.info(f"Loaded performance tracker with {len(self.windows)} UIDs")
+        except Exception as e:
+            bt.logging.error(f"Failed to load performance tracker: {e}")
 
 
 @dataclass
@@ -39,6 +168,17 @@ class WeightsManager:
     last_update_weights_block: int = 0
     proof_of_weights_queue: list[ProofOfWeightsItem] = field(default_factory=list)
     score_manager: "ScoreManager" = None
+    performance_tracker: PerformanceTracker = field(default=None)
+
+    def __post_init__(self):
+        if self.performance_tracker is None:
+            tracker_path = os.path.join(
+                os.path.expanduser("~"),
+                ".bittensor",
+                "subnet-2",
+                "performance_tracker.json",
+            )
+            self.performance_tracker = PerformanceTracker(persistence_path=tracker_path)
 
     def set_weights(self, netuid, wallet, uids, weights, version_key):
         return self.subtensor.set_weights(
@@ -46,7 +186,8 @@ class WeightsManager:
             wallet=wallet,
             uids=uids,
             weights=weights,
-            wait_for_inclusion=False,  # Don't block waiting for blockchain confirmation
+            wait_for_inclusion=True,
+            wait_for_finalization=True,
             version_key=version_key,
         )
 
@@ -66,6 +207,25 @@ class WeightsManager:
 
         return True, ""
 
+    def _compute_performance_weights(self, scores: torch.Tensor) -> torch.Tensor:
+        n = self.metagraph.n
+        weights = torch.zeros(n)
+        snap = self.performance_tracker.snapshot()
+        exploration_floor = 1.0 / n
+
+        for uid in range(n):
+            rate, count = snap.get(uid, (0.0, 0))
+            if count >= PERFORMANCE_MIN_SAMPLES:
+                weights[uid] = rate**PERFORMANCE_CURVE_POWER
+            elif uid < len(scores) and scores[uid] > 0:
+                weights[uid] = exploration_floor
+
+        total = weights.sum()
+        if total > 0:
+            weights = weights / total
+
+        return weights
+
     def update_weights(self, scores: torch.Tensor) -> bool:
         """Updates the weights based on the given scores and sets them on the chain."""
         should_update, message = self.should_update_weights()
@@ -75,13 +235,20 @@ class WeightsManager:
 
         bt.logging.info("Updating weights")
 
-        weights = torch.zeros(self.metagraph.n)
-        nonzero_indices = scores.nonzero()
-        bt.logging.debug(
-            f"Weights: {weights}, Nonzero indices: {nonzero_indices}, Scores: {scores}"
-        )
-        if nonzero_indices.sum() > 0:
-            weights[nonzero_indices] = scores[nonzero_indices]
+        weights = self._compute_performance_weights(scores)
+
+        snap = self.performance_tracker.snapshot()
+        tracked = {
+            uid: rate
+            for uid, (rate, count) in snap.items()
+            if count >= PERFORMANCE_MIN_SAMPLES
+        }
+        if tracked:
+            top = sorted(tracked.items(), key=lambda x: x[1], reverse=True)[:5]
+            bt.logging.info(
+                f"Performance tracker: {len(tracked)} UIDs tracked, "
+                f"top 5: {[(uid, f'{rate:.2%}') for uid, rate in top]}"
+            )
 
         owner_hotkey = self.subtensor.get_subnet_owner_hotkey(self.metagraph.netuid)
         if owner_hotkey and owner_hotkey in self.metagraph.hotkeys:
@@ -105,6 +272,7 @@ class WeightsManager:
                 bt.logging.success("Weights were set successfully")
                 log_weights(weights)
                 self.last_update_weights_block = int(self.metagraph.block.item())
+                self.performance_tracker.save()
                 return True
             return False
 

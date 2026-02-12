@@ -46,7 +46,6 @@ from constants import (
     DEFAULT_PROOF_SIZE,
     EXCEPTION_DELAY_SECONDS,
     FIVE_MINUTES,
-    IDLE_BENCHMARK_PROBABILITY,
     LOOP_DELAY_SECONDS,
     MAX_CONCURRENT_REQUESTS,
     ONE_HOUR,
@@ -59,7 +58,7 @@ from utils.gc_logging import log_responses as gc_log_responses
 # Set to True for synchronous request processing (easier debugging)
 DEBUG_SYNC_MODE = os.environ.get("DEBUG_SYNC_MODE", "").lower() in ("1", "true", "yes")
 
-MAX_SLICE_RETRIES = 20
+MAX_SLICE_RETRIES = 5
 
 
 class ValidatorLoop:
@@ -91,7 +90,6 @@ class ValidatorLoop:
 
         self.dsperse_manager = DSperseManager(
             event_client=self.dsperse_event_client,
-            incremental_mode=True,
         )
 
         self.score_manager = ScoreManager(
@@ -108,8 +106,11 @@ class ValidatorLoop:
             score_manager=self.score_manager,
         )
         self.last_pow_commit_block = 0
+        self._dispatch_event = asyncio.Event()
         self.relay = RelayManager(self.config)
         self.relay.dsperse_manager = self.dsperse_manager
+        self.relay.dispatch_event = self._dispatch_event
+        self.dsperse_manager.on_api_run_complete = self.relay.on_api_run_complete
         self.request_pipeline = RequestPipeline(
             self.config, self.score_manager, self.relay
         )
@@ -117,7 +118,7 @@ class ValidatorLoop:
         self.request_queue = asyncio.Queue()
         self.active_tasks: dict[str, asyncio.Task | None] = {}
         self.miner_active_count: dict[int, int] = {}
-        self.default_miner_capacity = 10
+        self.default_miner_capacity = 1
         self.queryable_uids: list[int] = []
         self.last_response_time = time.time()
         self.last_periodic_task_time = time.time()
@@ -133,6 +134,10 @@ class ValidatorLoop:
 
         if self.config.bt_config.prometheus_monitoring:
             start_prometheus_logging(self.config.bt_config.prometheus_port)
+
+    @with_rate_limit(period=FIVE_MINUTES)
+    def save_performance_tracker(self):
+        self.weights_manager.performance_tracker.save()
 
     @with_rate_limit(period=ONE_MINUTE)
     async def update_weights(self):
@@ -262,11 +267,19 @@ class ValidatorLoop:
                 slots_available = self.current_concurrency - len(self.active_tasks)
 
                 if not slots_available:
-                    await asyncio.sleep(1)
+                    self._dispatch_event.clear()
+                    try:
+                        await asyncio.wait_for(self._dispatch_event.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
                     continue
 
                 if self.relay.stacked_requests_queue.empty():
-                    new_requests = list(self.dsperse_manager.generate_dslice_requests())
+                    new_requests = list(
+                        await asyncio.to_thread(
+                            self.dsperse_manager.generate_dslice_requests
+                        )
+                    )
                     if new_requests:
                         bt.logging.info(
                             f"Generated {len(new_requests)} new requests, inserting into queue"
@@ -316,10 +329,6 @@ class ValidatorLoop:
                             )
                         elif not self.relay.stacked_requests_queue.empty():
                             request = self.request_pipeline._prepare_queued_request(uid)
-                        elif random.random() < IDLE_BENCHMARK_PROBABILITY:
-                            request = self.request_pipeline._prepare_benchmark_request(
-                                uid
-                            )
                         else:
                             break
 
@@ -357,7 +366,14 @@ class ValidatorLoop:
 
                         requests_sent += 1
 
-                await asyncio.sleep(0)
+                if requests_sent == 0:
+                    self._dispatch_event.clear()
+                    try:
+                        await asyncio.wait_for(self._dispatch_event.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                else:
+                    await asyncio.sleep(0)
             except Exception as e:
                 bt.logging.error(f"Error maintaining request pool: {e}")
                 traceback.print_exc()
@@ -375,6 +391,8 @@ class ValidatorLoop:
         if uid in self.miner_active_count:
             self.miner_active_count[uid] = max(0, self.miner_active_count[uid] - 1)
 
+        self._dispatch_event.set()
+
     async def run_periodic_tasks(self):
         while self._should_run:
             try:
@@ -384,6 +402,7 @@ class ValidatorLoop:
                 await self.sync_metagraph()
                 await self.sync_scores_uids()
                 await self.update_weights()
+                self.save_performance_tracker()
                 self.update_queryable_uids()
                 self.log_health()
                 await self.log_responses()
@@ -456,6 +475,14 @@ class ValidatorLoop:
             except Exception as e:
                 bt.logging.error(f"WATCHDOG error: {e}")
 
+    async def _load_circuits_background(self):
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool, circuit_store.load_circuits
+            )
+        except Exception as e:
+            bt.logging.error(f"Background circuit loading failed: {e}")
+
     async def run(self) -> NoReturn:
         """
         Run the main validator loop indefinitely.
@@ -464,12 +491,13 @@ class ValidatorLoop:
             f"Validator started on subnet {self.config.subnet_uid} using UID {self.config.user_uid}"
         )
 
-        # Start the relay client connection
         self.relay.start()
         self.dsperse_event_client.start()
+        self.dsperse_manager._loop = asyncio.get_running_loop()
 
         try:
             await asyncio.gather(
+                self._load_circuits_background(),
                 self.maintain_request_pool(),
                 self.run_periodic_tasks(),
                 self.watchdog(),
@@ -488,6 +516,7 @@ class ValidatorLoop:
         Perform a single request to a miner and handle the response.
         """
         response: MinerResponse | None = None
+        rescheduled = False
         try:
             response = await query_miner(
                 self.httpx_client,
@@ -496,12 +525,10 @@ class ValidatorLoop:
             )
 
             if DEBUG_SYNC_MODE:
-                # Direct sync call for easier debugging
                 response = self.response_processor.verify_single_response(
                     request, response
                 )
             else:
-                # Run in thread pool to avoid blocking event loop
                 response: (
                     MinerResponse | None
                 ) = await asyncio.get_event_loop().run_in_executor(
@@ -514,30 +541,38 @@ class ValidatorLoop:
         except (EmptyProofException, IncorrectProofException) as e:
             bt.logging.warning(f"{e.message}")
             self._reschedule_request(request)
+            rescheduled = True
         except httpx.InvalidURL:
             bt.logging.warning(
                 f"Ignoring UID as there is not a valid URL: {request.uid}. {request.ip}:{request.port}"
             )
             self._reschedule_request(request)
+            rescheduled = True
         except httpx.HTTPError as e:
             bt.logging.warning(
                 f"Failed to query miner for UID: {request.uid}. {request.ip}:{request.port} Error: {e}"
             )
             self._reschedule_request(request)
+            rescheduled = True
         except Exception as e:
             bt.logging.error(f"Error processing request for UID {request.uid}: {e}")
             traceback.print_exc()
             log_error("request_processing", "axon_query", str(e))
             self._reschedule_request(request)
+            rescheduled = True
         finally:
             if response:
                 await self._handle_response(response)
+            elif not rescheduled:
+                self.weights_manager.performance_tracker.record(request.uid, False)
 
     def _reschedule_request(self, request: Request) -> None:
         """
         Reschedule a failed request for retry.
         Only RWR and DSLICE requests are rescheduled, up to MAX_SLICE_RETRIES times.
         """
+        self.weights_manager.performance_tracker.record_reschedule(request.uid)
+
         if request.request_type not in (RequestType.RWR, RequestType.DSLICE):
             bt.logging.debug(
                 f"Not rescheduling request type {request.request_type} for UID {request.uid}"
@@ -594,15 +629,11 @@ class ValidatorLoop:
                 tile_idx=tile_idx,
                 success=False,
             )
-        elif self.dsperse_manager.is_incremental_run(queued.run_uid):
+        else:
             self.dsperse_manager.on_incremental_slice_result(
                 run_uid=queued.run_uid,
                 slice_num=str(queued.slice_num),
                 success=False,
-            )
-        else:
-            self.dsperse_manager.on_slice_result(
-                queued.run_uid, str(queued.slice_num), success=False
             )
 
     def _mark_dslice_complete(self, response: MinerResponse) -> None:
@@ -633,6 +664,7 @@ class ValidatorLoop:
                     computed_outputs=response.computed_outputs,
                     proof=response.proof_content,
                     witness=response.witness,
+                    proof_system=response.proof_system,
                     response_time_sec=response.response_time,
                     verification_time_sec=response.verification_time or 0.0,
                 )
@@ -647,9 +679,7 @@ class ValidatorLoop:
                 bt.logging.info(
                     f"Queued {len(next_requests)} items for {run_uid} (size now: {queue.qsize()})"
                 )
-        elif response.is_incremental or self.dsperse_manager.is_incremental_run(
-            run_uid
-        ):
+        else:
             is_complete, next_request = (
                 self.dsperse_manager.on_incremental_slice_result(
                     run_uid=run_uid,
@@ -657,6 +687,7 @@ class ValidatorLoop:
                     success=True,
                     computed_outputs=response.computed_outputs,
                     proof=response.proof_content,
+                    proof_system=response.proof_system,
                     response_time_sec=response.response_time,
                     verification_time_sec=response.verification_time or 0.0,
                 )
@@ -664,14 +695,6 @@ class ValidatorLoop:
             if next_request and not is_complete:
                 self.relay.stacked_requests_queue.put_nowait(next_request)
                 bt.logging.debug(f"Queued next incremental slice for run {run_uid}")
-        else:
-            self.dsperse_manager.on_slice_result(
-                run_uid,
-                str(slice_num),
-                success=True,
-                response_time_sec=response.response_time,
-                verification_time_sec=response.verification_time or 0.0,
-            )
 
     async def _handle_response(self, response: MinerResponse) -> None:
         """
@@ -681,6 +704,12 @@ class ValidatorLoop:
             response (MinerResponse): The processed response to handle.
         """
         try:
+            self.weights_manager.performance_tracker.record(
+                response.uid,
+                bool(response.verification_result),
+                response_time_sec=response.response_time,
+            )
+
             request_hash = response.external_request_hash
             if response.verification_result:
                 bt.logging.info(

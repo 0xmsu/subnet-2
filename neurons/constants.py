@@ -1,5 +1,11 @@
 import os
 from dataclasses import dataclass
+from enum import Enum
+
+
+class RunSource(str, Enum):
+    BENCHMARK = "benchmark"
+    API = "api"
 
 
 @dataclass
@@ -177,6 +183,12 @@ IDLE_BENCHMARK_PROBABILITY = 0.1
 EMA_BOOST_FACTOR = 1.2
 # EMA enabled flag
 EMA_ENABLED = False
+
+PERFORMANCE_WINDOW_SIZE = 2000
+PERFORMANCE_CURVE_POWER = 5.0
+PERFORMANCE_MIN_SAMPLES = 5
+PERFORMANCE_RESCHEDULE_PENALTY = -0.4
+PERFORMANCE_RESPONSE_TIME_WEIGHT = 0.3
 
 CIRCUIT_API_URL = os.getenv("CIRCUIT_API_URL", "https://repository.inferencelabs.com")
 CIRCUIT_R2_BASE_URL = os.getenv(
