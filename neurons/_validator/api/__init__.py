@@ -100,7 +100,7 @@ class RelayManager:
         self._onnx_lock = threading.Lock()
         self._onnx_result_queue: mp.Queue = _spawn_ctx.Queue()
         self._onnx_processes: dict[str, mp.Process] = {}
-        self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
         self._ws: websockets.WebSocketClientProtocol | None = None
