@@ -593,6 +593,7 @@ class IncrementalRunner:
         if work_item.tile_idx is not None:
             slice_num = f"{slice_num}_tile_{work_item.tile_idx}"
 
+        state = self._runs.get(work_item.run_uid)
         return DSliceQueuedProofRequest(
             circuit=work_item.circuit,
             inputs=work_item.inputs,
@@ -603,6 +604,7 @@ class IncrementalRunner:
             is_tile=work_item.tile_idx is not None,
             tile_idx=work_item.tile_idx,
             task_id=work_item.task_id,
+            run_source=state.run_source if state else RunSource.BENCHMARK,
         )
 
     def _ensure_extracted(self, state: RunState, slice_id: str) -> None:
