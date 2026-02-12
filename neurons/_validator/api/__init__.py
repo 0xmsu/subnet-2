@@ -52,6 +52,8 @@ _spawn_ctx = mp.get_context("spawn")
 
 _ONNX_OUTPUT_TTL_SEC = 600
 
+_CLASS_NAMES = {0: "football", 1: "goalkeeper", 2: "player", 3: "referee"}
+
 
 def _yolo_nms(
     output: np.ndarray,
@@ -101,6 +103,7 @@ def _yolo_nms(
             "h": float(h_val) / img_h,
             "confidence": float(max_conf[i]),
             "class_id": int(class_ids[i]),
+            "class_name": _CLASS_NAMES.get(int(class_ids[i]), str(int(class_ids[i]))),
         }
         for i, w_val, h_val in [(k, w[k], h[k]) for k in keep]
     ]
