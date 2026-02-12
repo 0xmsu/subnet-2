@@ -384,7 +384,20 @@ class RelayManager:
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 
-            self.dsperse_manager.abort_benchmark_runs()
+            self.dsperse_manager.abort_active_runs()
+
+            onnx_output = None
+            try:
+                output_tensor = await asyncio.to_thread(
+                    self.dsperse_manager.run_onnx_inference,
+                    circuit,
+                    copy.deepcopy(inputs),
+                )
+                if output_tensor is not None:
+                    onnx_output = output_tensor.tolist()
+                    bt.logging.info(f"ONNX inference complete for circuit {circuit_id}")
+            except Exception as e:
+                bt.logging.warning(f"ONNX inference failed, continuing: {e}")
 
             run_uid = await asyncio.to_thread(
                 self.dsperse_manager.start_incremental_run,
@@ -404,21 +417,20 @@ class RelayManager:
                 self.dispatch_event.set()
 
             status = self.dsperse_manager.get_run_status(run_uid)
-            if not status:
-                return Success(
-                    {"run_uid": run_uid, "status": "processing", "progress": {}}
-                )
-            bt.logging.success(
-                f"Run {run_uid} created: {status.total_slices} slices queued"
-            )
+            response = {
+                "run_uid": run_uid,
+                "status": "processing",
+                "progress": status.to_dict() if status else {},
+            }
+            if onnx_output is not None:
+                response["output"] = onnx_output
 
-            return Success(
-                {
-                    "run_uid": run_uid,
-                    "status": "processing",
-                    "progress": status.to_dict(),
-                }
-            )
+            if status:
+                bt.logging.success(
+                    f"Run {run_uid} created: {status.total_slices} slices queued"
+                )
+
+            return Success(response)
 
         except Exception as e:
             bt.logging.error(f"Error in DSperse submission: {str(e)}")

@@ -7,7 +7,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from bittensor import logging
@@ -456,6 +456,20 @@ class DSperseManager:
                 f"Aborted {len(aborted)} benchmark runs for incoming API request"
             )
         return aborted
+
+    def abort_active_runs(self) -> list[str]:
+        with self._incremental_runs_lock:
+            active_uids = list(self._incremental_runs)
+        aborted = []
+        for run_uid in active_uids:
+            self._incremental_runner.abort_run(run_uid)
+            aborted.append(run_uid)
+        if aborted:
+            logging.info(f"Aborted {len(aborted)} active runs for incoming request")
+        return aborted
+
+    def run_onnx_inference(self, circuit: Circuit, inputs: dict) -> Any:
+        return self._incremental_runner.run_onnx_inference(circuit, inputs)
 
     _COMPLETED_STATUS_TTL_SEC = 600
 

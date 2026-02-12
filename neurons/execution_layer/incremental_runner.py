@@ -518,6 +518,33 @@ class IncrementalRunner:
         logging.warning(f"Run {run_uid} aborted (preempted)")
         self._on_complete(state)
 
+    def run_onnx_inference(self, circuit: Circuit, inputs: dict) -> Optional[Any]:
+        """Run the full model through ONNX locally and return the final output tensor."""
+        run_uid = self.start_run(circuit, inputs, RunSource.API)
+        state = self._runs[run_uid]
+        try:
+            max_steps = len(state.execution_order) * 200
+            for _ in range(max_steps):
+                if state.is_complete or state.aborted:
+                    break
+                slice_id = state.current_slice_id
+                if slice_id is None:
+                    break
+                meta = state.slice_metadata.get(slice_id)
+                if not meta:
+                    break
+                required_inputs = meta.dependencies.filtered_inputs
+                if any(i not in state.tensor_cache for i in required_inputs):
+                    break
+                self._ensure_extracted(state, slice_id)
+                self._run_onnx_locally(state, slice_id, meta)
+                self._cleanup_extracted_slice(state, slice_id)
+                state.completed_slices.append(slice_id)
+                state.current_idx += 1
+            return self.get_final_output(run_uid)
+        finally:
+            self.cleanup_run(run_uid)
+
     def get_run_source(self, run_uid: str) -> RunSource | None:
         if run_uid not in self._runs:
             return None
