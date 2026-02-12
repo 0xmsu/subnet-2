@@ -50,6 +50,53 @@ def _decode_protobuf_input(data: bytes) -> np.ndarray:
 _spawn_ctx = mp.get_context("spawn")
 
 
+def _yolo_nms(output: np.ndarray, conf_threshold=0.25, iou_threshold=0.45):
+    if output.ndim == 3:
+        output = output[0]
+    predictions = output.T
+    cx, cy, w, h = (
+        predictions[:, 0],
+        predictions[:, 1],
+        predictions[:, 2],
+        predictions[:, 3],
+    )
+    class_probs = predictions[:, 4:]
+    max_conf = class_probs.max(axis=1)
+    mask = max_conf >= conf_threshold
+    cx, cy, w, h = cx[mask], cy[mask], w[mask], h[mask]
+    class_probs = class_probs[mask]
+    max_conf = max_conf[mask]
+    class_ids = class_probs.argmax(axis=1)
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
+    areas = w * h
+    order = max_conf.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        order = order[1:][iou <= iou_threshold]
+    return [
+        {
+            "x": float(cx[i]),
+            "y": float(cy[i]),
+            "w": float(w_val),
+            "h": float(h_val),
+            "confidence": float(max_conf[i]),
+            "class_id": int(class_ids[i]),
+        }
+        for i, w_val, h_val in [(k, w[k], h[k]) for k in keep]
+    ]
+
+
 def _onnx_inference_worker(
     model_path: str, input_data, run_uid: str, result_queue: mp.Queue
 ):
@@ -67,7 +114,8 @@ def _onnx_inference_worker(
         sess = ort.InferenceSession(model_path)
         input_name = sess.get_inputs()[0].name
         result = sess.run(None, {input_name: arr})
-        result_queue.put((run_uid, result[0].tolist()))
+        detections = _yolo_nms(result[0])
+        result_queue.put((run_uid, detections))
     except Exception as exc:
         result_queue.put((run_uid, None, str(exc)))
 
