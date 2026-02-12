@@ -358,17 +358,40 @@ class RelayManager:
             traceback.print_exc()
             return Error(9, "Request processing failed", str(e))
 
+    _FULL_ONNX_MODELS: dict[str, str] = {
+        "f83391c1200422f2fe48b08c743790a440186c7ec349a765347ba9884a93dc18": (
+            "/home/ubuntu/subnet-2/football-player-detection.onnx"
+        ),
+    }
+
     def _run_onnx_background(self, run_uid: str, circuit, inputs: dict) -> None:
+        import numpy as np
+        import onnxruntime as ort
+
+        circuit_id = circuit.id
+        model_path = self._FULL_ONNX_MODELS.get(circuit_id)
+        if not model_path:
+            return
+
         try:
-            output_tensor = self.dsperse_manager.run_onnx_inference(
-                circuit, copy.deepcopy(inputs)
-            )
-            if output_tensor is not None:
-                with self._onnx_lock:
-                    self._onnx_outputs[run_uid] = output_tensor.tolist()
-                bt.logging.info(f"Background ONNX complete for run {run_uid}")
+            input_data = inputs.get("input_data")
+            if input_data is None:
+                return
+            arr = np.array(input_data, dtype=np.float32)
+            if arr.ndim == 3:
+                arr = np.expand_dims(arr, 0)
+
+            sess = ort.InferenceSession(model_path)
+            input_name = sess.get_inputs()[0].name
+            result = sess.run(None, {input_name: arr})
+            output = result[0].tolist()
+
+            with self._onnx_lock:
+                self._onnx_outputs[run_uid] = output
+            bt.logging.info(f"Full-model ONNX complete for run {run_uid}")
         except Exception as e:
-            bt.logging.warning(f"Background ONNX failed for run {run_uid}: {e}")
+            bt.logging.warning(f"Full-model ONNX failed for run {run_uid}: {e}")
+            traceback.print_exc()
 
     async def handle_dsperse_submit(self, **params: object) -> dict[str, object]:
         circuit_id = params.get("circuit_id")
