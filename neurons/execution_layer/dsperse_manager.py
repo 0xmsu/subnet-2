@@ -57,11 +57,6 @@ class DSperseManager:
         self,
         event_client: "DsperseEventClient | None" = None,
     ):
-        self.circuits: list[Circuit] = [
-            circuit
-            for circuit in circuit_store.circuits.values()
-            if circuit.metadata.type == CircuitType.DSPERSE_PROOF_GENERATION
-        ]
         self.event_client = event_client
         self._incremental_runner = IncrementalRunner(
             on_run_complete=self._on_incremental_run_complete,
