@@ -460,12 +460,18 @@ class RelayManager:
             return InvalidParams("Missing or invalid inputs")
 
         try:
+            loop = asyncio.get_running_loop()
             protobuf_b64 = inputs.get("protobuf") if isinstance(inputs, dict) else None
             protobuf_array = None
             if protobuf_b64:
                 raw_bytes = base64.b64decode(protobuf_b64)
-                protobuf_array = _decode_protobuf_input(raw_bytes)
-                inputs = {"input_data": protobuf_array.tolist()}
+                protobuf_array = await loop.run_in_executor(
+                    self._relay_executor, _decode_protobuf_input, raw_bytes
+                )
+                inputs = await loop.run_in_executor(
+                    self._relay_executor,
+                    lambda: {"input_data": protobuf_array.tolist()},
+                )
                 bt.logging.info(
                     f"Decoded protobuf input: shape={list(protobuf_array.shape)}"
                 )
@@ -485,8 +491,6 @@ class RelayManager:
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 
-            loop = asyncio.get_running_loop()
-
             await loop.run_in_executor(
                 self._relay_executor,
                 self.dsperse_manager.abort_active_runs,
@@ -500,12 +504,15 @@ class RelayManager:
                 RunSource.API,
             )
 
-            if protobuf_array is not None:
-                self._spawn_onnx_process(
-                    run_uid, circuit, {"input_data": protobuf_array}
-                )
-            else:
-                self._spawn_onnx_process(run_uid, circuit, inputs)
+            try:
+                if protobuf_array is not None:
+                    self._spawn_onnx_process(
+                        run_uid, circuit, {"input_data": protobuf_array}
+                    )
+                else:
+                    self._spawn_onnx_process(run_uid, circuit, inputs)
+            except Exception as onnx_err:
+                bt.logging.warning(f"ONNX spawn failed (non-fatal): {onnx_err}")
 
             requests = await loop.run_in_executor(
                 self._relay_executor,
