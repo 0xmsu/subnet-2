@@ -10,6 +10,7 @@ import multiprocessing as mp
 import os
 import queue
 import threading
+import time
 import traceback
 
 import bittensor as bt
@@ -18,7 +19,7 @@ import onnxruntime as ort
 import websockets
 from deployment_layer.circuit_store import circuit_store
 from execution_layer.dsperse_manager import DSperseManager
-from execution_layer.proof_uploader import upload_run_proofs
+from execution_layer.proof_uploader import upload_final_output, upload_run_proofs
 from jsonrpcserver import (
     Error,
     InvalidParams,
@@ -49,8 +50,16 @@ def _decode_protobuf_input(data: bytes) -> np.ndarray:
 
 _spawn_ctx = mp.get_context("spawn")
 
+_ONNX_OUTPUT_TTL_SEC = 600
 
-def _yolo_nms(output: np.ndarray, conf_threshold=0.25, iou_threshold=0.45):
+
+def _yolo_nms(
+    output: np.ndarray,
+    img_h: int = 1,
+    img_w: int = 1,
+    conf_threshold=0.25,
+    iou_threshold=0.45,
+):
     if output.ndim == 3:
         output = output[0]
     predictions = output.T
@@ -86,10 +95,10 @@ def _yolo_nms(output: np.ndarray, conf_threshold=0.25, iou_threshold=0.45):
         order = order[1:][iou <= iou_threshold]
     return [
         {
-            "x": float(cx[i]),
-            "y": float(cy[i]),
-            "w": float(w_val),
-            "h": float(h_val),
+            "x": float(cx[i]) / img_w,
+            "y": float(cy[i]) / img_h,
+            "w": float(w_val) / img_w,
+            "h": float(h_val) / img_h,
             "confidence": float(max_conf[i]),
             "class_id": int(class_ids[i]),
         }
@@ -114,7 +123,8 @@ def _onnx_inference_worker(
         sess = ort.InferenceSession(model_path)
         input_name = sess.get_inputs()[0].name
         result = sess.run(None, {input_name: arr})
-        detections = _yolo_nms(result[0])
+        img_h, img_w = arr.shape[2], arr.shape[3]
+        detections = _yolo_nms(result[0], img_h=img_h, img_w=img_w)
         result_queue.put((run_uid, detections))
     except Exception as exc:
         result_queue.put((run_uid, None, str(exc)))
@@ -220,10 +230,11 @@ class RelayManager:
         self.is_testnet = config.bt_config.subtensor.network == "test"
         self.dsperse_manager: DSperseManager | None = None
         self.dispatch_event: asyncio.Event | None = None
-        self._onnx_outputs: dict[str, list] = {}
+        self._onnx_outputs: dict[str, tuple[float, list]] = {}
         self._onnx_lock = threading.Lock()
         self._onnx_result_queue: mp.Queue = _spawn_ctx.Queue()
         self._onnx_processes: dict[str, mp.Process] = {}
+        self._onnx_circuit_ids: dict[str, str] = {}
         self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
@@ -245,11 +256,34 @@ class RelayManager:
                 else:
                     run_uid, output = msg
                     with self._onnx_lock:
-                        self._onnx_outputs[run_uid] = output
+                        self._onnx_outputs[run_uid] = (time.monotonic(), output)
                     bt.logging.info(f"Full-model ONNX complete for run {run_uid}")
+
+                    circuit_id = self._onnx_circuit_ids.pop(run_uid, None)
+                    if output and circuit_id:
+                        threading.Thread(
+                            target=self._upload_onnx_output,
+                            args=(run_uid, circuit_id, output),
+                            daemon=True,
+                        ).start()
+
                 self._onnx_processes.pop(run_uid, None)
             except Exception as e:
                 bt.logging.warning(f"ONNX result monitor error: {e}")
+
+    def _upload_onnx_output(self, run_uid: str, circuit_id: str, output: list) -> None:
+        try:
+            upload_final_output(run_uid, circuit_id, {"detections": output})
+            bt.logging.info(f"Uploaded ONNX output for run {run_uid}")
+        except Exception as e:
+            bt.logging.warning(f"Failed to upload ONNX output for {run_uid}: {e}")
+
+    def _evict_stale_onnx_outputs(self) -> None:
+        cutoff = time.monotonic() - _ONNX_OUTPUT_TTL_SEC
+        with self._onnx_lock:
+            stale = [k for k, (ts, _) in self._onnx_outputs.items() if ts < cutoff]
+            for k in stale:
+                del self._onnx_outputs[k]
 
     def start(self) -> None:
         if not self.config.relay_enabled:
@@ -441,6 +475,7 @@ class RelayManager:
         input_data = inputs.get("input_data")
         if input_data is None:
             return
+        self._onnx_circuit_ids[run_uid] = circuit.id
         p = _spawn_ctx.Process(
             target=_onnx_inference_worker,
             args=(model_path, input_data, run_uid, self._onnx_result_queue),
@@ -513,28 +548,15 @@ class RelayManager:
             except Exception as onnx_err:
                 bt.logging.warning(f"ONNX spawn failed (non-fatal): {onnx_err}")
 
-            requests = await loop.run_in_executor(
-                self._relay_executor,
-                self.dsperse_manager.get_next_incremental_work,
-                run_uid,
-            )
-
-            for request in requests:
-                self.stacked_requests_queue.put_nowait(request)
             if self.dispatch_event:
                 self.dispatch_event.set()
 
-            status = self.dsperse_manager.get_run_status(run_uid)
-            if status:
-                bt.logging.success(
-                    f"Run {run_uid} created: {status.total_slices} slices queued"
-                )
+            self._evict_stale_onnx_outputs()
 
             return Success(
                 {
                     "run_uid": run_uid,
                     "status": "processing",
-                    "progress": status.to_dict() if status else {},
                 }
             )
 
@@ -554,11 +576,23 @@ class RelayManager:
 
         status = self.dsperse_manager.get_run_status(run_uid)
         if not status:
+            with self._onnx_lock:
+                entry = self._onnx_outputs.get(run_uid)
+            if entry:
+                return Success(
+                    {
+                        "run_uid": run_uid,
+                        "status": "completed",
+                        "progress": {},
+                        "output": entry[1],
+                    }
+                )
             return Error(11, "Run not found", f"No run with ID {run_uid}")
 
         try:
             with self._onnx_lock:
-                onnx_output = self._onnx_outputs.get(run_uid)
+                entry = self._onnx_outputs.get(run_uid)
+            onnx_output = entry[1] if entry else None
 
             if status.is_complete:
                 run_status = (
@@ -584,8 +618,6 @@ class RelayManager:
             return Error(9, "Failed to get run status", str(e))
 
     def _cleanup_run(self, run_uid: str) -> None:
-        with self._onnx_lock:
-            self._onnx_outputs.pop(run_uid, None)
         proc = self._onnx_processes.pop(run_uid, None)
         if proc and proc.is_alive():
             proc.kill()
