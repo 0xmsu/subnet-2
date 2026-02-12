@@ -36,6 +36,50 @@ from _validator.models.request_type import RequestType
 
 
 @dataclass
+class RunStatus:
+    run_uid: str
+    circuit_name: str
+    total_slices: int
+    total_tiles: int
+    slice_tile_counts: dict[str, int]
+    current_slice: Optional[str]
+    completed: int
+    failed: int
+    pending_work: int
+    is_complete: bool
+    elapsed_time: float
+    aborted: bool = False
+
+    @property
+    def all_successful(self) -> bool:
+        return self.is_complete and self.failed == 0 and not self.aborted
+
+    @property
+    def progress_percent(self) -> float:
+        if self.total_slices == 0:
+            return 0.0
+        return (self.completed + self.failed) / self.total_slices * 100
+
+    def to_dict(self) -> dict:
+        return {
+            "run_uid": self.run_uid,
+            "circuit_name": self.circuit_name,
+            "total_slices": self.total_slices,
+            "total_tiles": self.total_tiles,
+            "slice_tile_counts": self.slice_tile_counts,
+            "current_slice": self.current_slice,
+            "completed": self.completed,
+            "failed": self.failed,
+            "pending_work": self.pending_work,
+            "is_complete": self.is_complete,
+            "elapsed_time": self.elapsed_time,
+            "aborted": self.aborted,
+            "all_successful": self.all_successful,
+            "progress_percent": self.progress_percent,
+        }
+
+
+@dataclass
 class WorkItem:
     """A single work item (slice or tile) to be processed."""
 
@@ -412,24 +456,24 @@ class IncrementalRunner:
 
         return False
 
-    def get_run_status(self, run_uid: str) -> Optional[dict]:
-        """Get run status."""
+    def get_run_status(self, run_uid: str) -> Optional[RunStatus]:
         if run_uid not in self._runs:
             return None
         state = self._runs[run_uid]
-        return {
-            "run_uid": run_uid,
-            "circuit_name": state.circuit.metadata.name,
-            "total_slices": len(state.execution_order),
-            "total_tiles": state.total_tiles,
-            "slice_tile_counts": state.slice_tile_counts,
-            "current_slice": state.current_slice_id,
-            "completed": len(state.completed_slices),
-            "failed": len(state.failed_slices),
-            "pending_work": len(state.pending_work),
-            "is_complete": state.is_complete,
-            "elapsed_time": time.perf_counter() - state.start_time,
-        }
+        return RunStatus(
+            run_uid=run_uid,
+            circuit_name=state.circuit.metadata.name,
+            total_slices=len(state.execution_order),
+            total_tiles=state.total_tiles,
+            slice_tile_counts=state.slice_tile_counts,
+            current_slice=state.current_slice_id,
+            completed=len(state.completed_slices),
+            failed=len(state.failed_slices),
+            pending_work=len(state.pending_work),
+            is_complete=state.is_complete,
+            elapsed_time=time.perf_counter() - state.start_time,
+            aborted=state.aborted,
+        )
 
     def get_final_output(self, run_uid: str) -> Optional[Any]:
         """Get final output tensor."""
@@ -857,13 +901,12 @@ class IncrementalRunner:
             )
 
     def _on_complete(self, state: RunState) -> None:
-        """Handle run completion."""
         elapsed = time.perf_counter() - state.start_time
-        success = len(state.failed_slices) == 0
+        success = len(state.failed_slices) == 0 and not state.aborted
         logging.info(
             f"Run {state.run_uid} complete. "
             f"Completed: {len(state.completed_slices)}, Failed: {len(state.failed_slices)}, "
-            f"Time: {elapsed:.2f}s"
+            f"Aborted: {state.aborted}, Time: {elapsed:.2f}s"
         )
         if self._on_run_complete:
             self._on_run_complete(state.run_uid, success)
