@@ -606,10 +606,14 @@ class RelayManager:
 
             self._evict_stale_onnx_outputs()
 
+            status = self.dsperse_manager._incremental_runner.get_run_status(run_uid)
             return Success(
                 {
                     "run_uid": run_uid,
                     "status": "processing",
+                    "total_slices": status.total_slices if status else 0,
+                    "total_tiles": status.total_tiles if status else 0,
+                    "slice_tile_counts": (status.slice_tile_counts if status else {}),
                 }
             )
 
