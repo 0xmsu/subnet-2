@@ -51,7 +51,6 @@ class RelayManager:
 
     def __init__(self, config: ValidatorConfig):
         self.config = config
-        # Queue of requests to be sent to miners (consumed by ValidatorLoop)
         self.stacked_requests_queue: asyncio.Queue = asyncio.Queue()
         self.rwr_queue: asyncio.Queue = asyncio.Queue()
         self.pending_requests: dict[str, asyncio.Event] = {}
@@ -59,14 +58,13 @@ class RelayManager:
         self.is_testnet = config.bt_config.subtensor.network == "test"
         self.dsperse_manager: DSperseManager | None = None
         self.dispatch_event: asyncio.Event | None = None
+        self._onnx_outputs: dict[str, list] = {}
 
-        # WebSocket client state
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._connected = asyncio.Event()
         self._should_run = True
         self._reconnect_delay = RELAY_RECONNECT_BASE_DELAY
 
-        # Queue for notifications to send when reconnected
         self._pending_notifications: list[dict] = []
         self._task: asyncio.Task | None = None
 
@@ -359,6 +357,17 @@ class RelayManager:
             traceback.print_exc()
             return Error(9, "Request processing failed", str(e))
 
+    def _run_onnx_background(self, run_uid: str, circuit: object, inputs: dict) -> None:
+        try:
+            output_tensor = self.dsperse_manager.run_onnx_inference(
+                circuit, copy.deepcopy(inputs)
+            )
+            if output_tensor is not None:
+                self._onnx_outputs[run_uid] = output_tensor.tolist()
+                bt.logging.info(f"Background ONNX complete for run {run_uid}")
+        except Exception as e:
+            bt.logging.warning(f"Background ONNX failed for run {run_uid}: {e}")
+
     async def handle_dsperse_submit(self, **params: object) -> dict[str, object]:
         circuit_id = params.get("circuit_id")
         inputs = params.get("inputs")
@@ -386,25 +395,18 @@ class RelayManager:
 
             self.dsperse_manager.abort_active_runs()
 
-            onnx_output = None
-            try:
-                output_tensor = await asyncio.to_thread(
-                    self.dsperse_manager.run_onnx_inference,
-                    circuit,
-                    copy.deepcopy(inputs),
-                )
-                if output_tensor is not None:
-                    onnx_output = output_tensor.tolist()
-                    bt.logging.info(f"ONNX inference complete for circuit {circuit_id}")
-            except Exception as e:
-                bt.logging.warning(f"ONNX inference failed, continuing: {e}")
-
             run_uid = await asyncio.to_thread(
                 self.dsperse_manager.start_incremental_run,
                 circuit,
                 inputs,
                 RunSource.API,
             )
+
+            threading.Thread(
+                target=self._run_onnx_background,
+                args=(run_uid, circuit, inputs),
+                daemon=True,
+            ).start()
 
             requests = await asyncio.to_thread(
                 self.dsperse_manager.get_next_incremental_work,
@@ -417,20 +419,18 @@ class RelayManager:
                 self.dispatch_event.set()
 
             status = self.dsperse_manager.get_run_status(run_uid)
-            response = {
-                "run_uid": run_uid,
-                "status": "processing",
-                "progress": status.to_dict() if status else {},
-            }
-            if onnx_output is not None:
-                response["output"] = onnx_output
-
             if status:
                 bt.logging.success(
                     f"Run {run_uid} created: {status.total_slices} slices queued"
                 )
 
-            return Success(response)
+            return Success(
+                {
+                    "run_uid": run_uid,
+                    "status": "processing",
+                    "progress": status.to_dict() if status else {},
+                }
+            )
 
         except Exception as e:
             bt.logging.error(f"Error in DSperse submission: {str(e)}")
@@ -459,9 +459,16 @@ class RelayManager:
             else:
                 run_status = "processing"
 
-            return Success(
-                {"run_uid": run_uid, "status": run_status, "progress": status.to_dict()}
-            )
+            response = {
+                "run_uid": run_uid,
+                "status": run_status,
+                "progress": status.to_dict(),
+            }
+            onnx_output = self._onnx_outputs.pop(run_uid, None)
+            if onnx_output is not None:
+                response["output"] = onnx_output
+
+            return Success(response)
 
         except Exception as e:
             bt.logging.error(f"Error getting run status: {str(e)}")

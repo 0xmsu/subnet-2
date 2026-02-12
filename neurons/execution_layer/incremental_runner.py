@@ -519,7 +519,6 @@ class IncrementalRunner:
         self._on_complete(state)
 
     def run_onnx_inference(self, circuit: Circuit, inputs: dict) -> Optional[Any]:
-        """Run the full model through ONNX locally and return the final output tensor."""
         run_uid = self.start_run(circuit, inputs, RunSource.API)
         state = self._runs[run_uid]
         try:

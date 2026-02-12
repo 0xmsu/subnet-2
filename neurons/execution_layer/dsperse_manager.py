@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import random
 import shutil
 import tempfile
@@ -14,9 +13,7 @@ from bittensor import logging
 from deployment_layer.circuit_store import circuit_store
 import time
 
-from dsperse.src.backends.ezkl import EZKL
 from dsperse.src.backends.jstprove import JSTprove
-from dsperse.src.run.runner import Runner
 from dsperse.src.slice.utils.converter import Converter
 from constants import RunSource
 from execution_layer.circuit import Circuit, CircuitType, ProofSystem
@@ -693,21 +690,10 @@ class DSperseManager:
         proof_system: ProofSystem,
     ) -> dict:
         """
-        Generate proof for a slice.
+        Generate proof for a slice using JSTprove.
 
-        In standard mode, both inputs and outputs are provided.
         In incremental mode (outputs=None), inference is run to compute outputs,
         which are returned in the result.
-
-        Args:
-            circuit_id: The circuit identifier
-            slice_num: Slice number (may include tile suffix like "0_tile_1")
-            inputs: Input tensor data
-            outputs: Expected output data (None for incremental mode)
-            proof_system: Proof system to use (JSTPROVE or EZKL)
-
-        Returns:
-            Dict with success, proof, proof_generation_time, and witness (for incremental)
         """
         incremental_mode = outputs is None
         circuit = self._get_circuit_by_id(circuit_id)
@@ -757,100 +743,28 @@ class DSperseManager:
                     incremental_mode=incremental_mode,
                 )
 
-            slice_copy = tmp_path / "slices"
-            shutil.copytree(model_dir, slice_copy)
-            runner = Runner(run_dir=tmp_path, threads=os.cpu_count() or 4, batch=True)
-            runner.run(input_json_path=input_file, slice_path=str(slice_copy))
-            run_dir = runner.last_run_dir
-            logging.info(f"Runner completed for slice_{slice_num}, run_dir: {run_dir}")
+            if proof_system != ProofSystem.JSTPROVE:
+                logging.error(f"Unsupported proof system: {proof_system}")
+                return result
 
-            if runner.run_metadata:
-                metadata_path = run_dir / "metadata.json"
-                with open(metadata_path, "w") as f:
-                    json.dump(runner.run_metadata.to_dict(), f)
+            jst_model_path = self._find_jstprove_circuit(
+                model_dir, base_slice_num, is_tiled=False
+            )
+            if jst_model_path is None or not jst_model_path.exists():
+                logging.error(f"JSTprove circuit not found for slice {slice_num}")
+                return result
 
             prove_start = time.time()
-
-            if proof_system == ProofSystem.JSTPROVE:
-                jst_model_path = self._find_jstprove_circuit(
-                    model_dir, base_slice_num, is_tiled=False
-                )
-                if jst_model_path is None or not jst_model_path.exists():
-                    logging.error(f"JSTprove circuit not found for slice {slice_num}")
-                    return result
-                success, proof_data, witness_data, _ = self._jstprove_witness_and_prove(
-                    jst_model_path,
-                    input_file,
-                    output_file,
-                    tmp_path,
-                    f"slice {slice_num}",
-                )
-                if incremental_mode and witness_data is not None:
-                    result["witness"] = witness_data
-                if not success and proof_data is None:
-                    return result
-
-            elif proof_system == ProofSystem.EZKL:
-                slice_id = f"slice_{base_slice_num}"
-                slice_meta = (
-                    runner.run_metadata.get_slice(slice_id)
-                    if runner.run_metadata
-                    else None
-                )
-                if not slice_meta:
-                    logging.error(
-                        f"No run metadata for {slice_id}, cannot prove with EZKL"
-                    )
-                    return result
-
-                ezkl_circuit_path = (
-                    slice_meta.ezkl_circuit_path or slice_meta.circuit_path
-                )
-                ezkl_pk_path = slice_meta.ezkl_pk_path or slice_meta.pk_path
-                ezkl_settings_path = (
-                    slice_meta.ezkl_settings_path or slice_meta.settings_path
-                )
-
-                if not ezkl_circuit_path or not ezkl_pk_path or not ezkl_settings_path:
-                    logging.error(
-                        f"Missing EZKL paths for {slice_id}: "
-                        f"circuit={ezkl_circuit_path}, pk={ezkl_pk_path}, settings={ezkl_settings_path}"
-                    )
-                    return result
-
-                ezkl_circuit = (
-                    Path(ezkl_circuit_path)
-                    if Path(ezkl_circuit_path).is_absolute()
-                    else model_dir / ezkl_circuit_path
-                )
-                ezkl_pk = (
-                    Path(ezkl_pk_path)
-                    if Path(ezkl_pk_path).is_absolute()
-                    else model_dir / ezkl_pk_path
-                )
-                ezkl_settings = (
-                    Path(ezkl_settings_path)
-                    if Path(ezkl_settings_path).is_absolute()
-                    else model_dir / ezkl_settings_path
-                )
-                witness_path = run_dir / slice_id / "output.json"
-                proof_path = tmp_path / "proof.json"
-
-                ezkl_runner = EZKL()
-                success, proof_file = ezkl_runner.prove(
-                    witness_path=str(witness_path),
-                    model_path=str(ezkl_circuit),
-                    proof_path=str(proof_path),
-                    pk_path=str(ezkl_pk),
-                    settings_path=str(ezkl_settings),
-                )
-
-                proof_data = None
-                if success and proof_path.exists():
-                    with open(proof_path, "r") as pf:
-                        proof_data = json.load(pf)
-            else:
-                logging.error(f"Unsupported proof system: {proof_system}")
+            success, proof_data, witness_data, _ = self._jstprove_witness_and_prove(
+                jst_model_path,
+                input_file,
+                output_file,
+                tmp_path,
+                f"slice {slice_num}",
+            )
+            if incremental_mode and witness_data is not None:
+                result["witness"] = witness_data
+            if not success and proof_data is None:
                 return result
 
             proof_generation_time = time.time() - prove_start
