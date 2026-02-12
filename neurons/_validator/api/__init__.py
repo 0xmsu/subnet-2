@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import copy
 import json
+import multiprocessing as mp
+import os
 import threading
 import traceback
 
 import bittensor as bt
+import numpy as np
+import onnxruntime as ort
 import websockets
 from deployment_layer.circuit_store import circuit_store
 from execution_layer.dsperse_manager import DSperseManager
@@ -21,10 +26,12 @@ from jsonrpcserver import (
 )
 from websockets.exceptions import ConnectionClosed
 
+from _validator.api.inference_pb2 import InferenceRequest
 from _validator.config import ValidatorConfig
 from _validator.models.poc_rpc_request import ProofOfComputationRPCRequest
 from _validator.models.request_type import RequestType
 from constants import (
+    CIRCUIT_API_URL,
     EXTERNAL_REQUEST_QUEUE_TIME_SECONDS,
     RELAY_AUTH_TIMEOUT,
     RELAY_OPEN_TIMEOUT,
@@ -32,6 +39,31 @@ from constants import (
     RELAY_RECONNECT_MAX_DELAY,
     RunSource,
 )
+
+
+def _decode_protobuf_input(data: bytes) -> np.ndarray:
+    msg = InferenceRequest()
+    msg.ParseFromString(data)
+    return np.array(msg.data, dtype=np.float32).reshape(msg.shape)
+
+
+def _onnx_inference_worker(
+    model_path: str, input_data, run_uid: str, result_queue: mp.Queue
+):
+    if isinstance(input_data, np.ndarray):
+        arr = (
+            input_data.astype(np.float32)
+            if input_data.dtype != np.float32
+            else input_data
+        )
+    else:
+        arr = np.array(input_data, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = np.expand_dims(arr, 0)
+    sess = ort.InferenceSession(model_path)
+    input_name = sess.get_inputs()[0].name
+    result = sess.run(None, {input_name: arr})
+    result_queue.put((run_uid, result[0].tolist()))
 
 
 class AuthenticationError(Exception):
@@ -60,6 +92,9 @@ class RelayManager:
         self.dispatch_event: asyncio.Event | None = None
         self._onnx_outputs: dict[str, list] = {}
         self._onnx_lock = threading.Lock()
+        self._onnx_result_queue: mp.Queue = mp.Queue()
+        self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._connected = asyncio.Event()
@@ -68,6 +103,16 @@ class RelayManager:
 
         self._pending_notifications: list[dict] = []
         self._task: asyncio.Task | None = None
+
+    def _monitor_onnx_results(self) -> None:
+        while True:
+            try:
+                run_uid, output = self._onnx_result_queue.get()
+                with self._onnx_lock:
+                    self._onnx_outputs[run_uid] = output
+                bt.logging.info(f"Full-model ONNX complete for run {run_uid}")
+            except Exception as e:
+                bt.logging.warning(f"ONNX result monitor error: {e}")
 
     def start(self) -> None:
         """Start the WebSocket client connection (called from ValidatorLoop)."""
@@ -112,7 +157,7 @@ class RelayManager:
             async with websockets.connect(
                 self.config.relay_url,
                 open_timeout=RELAY_OPEN_TIMEOUT,
-                ping_interval=None,
+                ping_interval=20,
                 ping_timeout=None,
                 max_size=100 * 1024 * 1024,
             ) as ws:
@@ -358,40 +403,36 @@ class RelayManager:
             traceback.print_exc()
             return Error(9, "Request processing failed", str(e))
 
-    _FULL_ONNX_MODELS: dict[str, str] = {
-        "f83391c1200422f2fe48b08c743790a440186c7ec349a765347ba9884a93dc18": (
-            "/home/ubuntu/subnet-2/football-player-detection.onnx"
-        ),
-    }
+    def _ensure_full_model(self, circuit) -> str | None:
+        model_path = circuit.paths.full_model
+        if os.path.exists(model_path):
+            return model_path
 
-    def _run_onnx_background(self, run_uid: str, circuit, inputs: dict) -> None:
-        import numpy as np
-        import onnxruntime as ort
+        url = f"{CIRCUIT_API_URL}/circuits/files/{circuit.id}/full_model.onnx"
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        bt.logging.info(
+            f"Downloading full ONNX model for circuit {circuit.id} to {model_path}"
+        )
+        try:
+            circuit_store._download_file(url, model_path)
+        except Exception as e:
+            bt.logging.warning(f"Full ONNX model not available for {circuit.id}: {e}")
+            return None
+        return model_path if os.path.exists(model_path) else None
 
-        circuit_id = circuit.id
-        model_path = self._FULL_ONNX_MODELS.get(circuit_id)
+    def _spawn_onnx_process(self, run_uid: str, circuit, inputs: dict) -> None:
+        model_path = self._ensure_full_model(circuit)
         if not model_path:
             return
-
-        try:
-            input_data = inputs.get("input_data")
-            if input_data is None:
-                return
-            arr = np.array(input_data, dtype=np.float32)
-            if arr.ndim == 3:
-                arr = np.expand_dims(arr, 0)
-
-            sess = ort.InferenceSession(model_path)
-            input_name = sess.get_inputs()[0].name
-            result = sess.run(None, {input_name: arr})
-            output = result[0].tolist()
-
-            with self._onnx_lock:
-                self._onnx_outputs[run_uid] = output
-            bt.logging.info(f"Full-model ONNX complete for run {run_uid}")
-        except Exception as e:
-            bt.logging.warning(f"Full-model ONNX failed for run {run_uid}: {e}")
-            traceback.print_exc()
+        input_data = inputs.get("input_data")
+        if input_data is None:
+            return
+        p = mp.Process(
+            target=_onnx_inference_worker,
+            args=(model_path, input_data, run_uid, self._onnx_result_queue),
+            daemon=True,
+        )
+        p.start()
 
     async def handle_dsperse_submit(self, **params: object) -> dict[str, object]:
         circuit_id = params.get("circuit_id")
@@ -403,6 +444,16 @@ class RelayManager:
             return InvalidParams("Missing or invalid inputs")
 
         try:
+            protobuf_b64 = inputs.get("protobuf") if isinstance(inputs, dict) else None
+            protobuf_array = None
+            if protobuf_b64:
+                raw_bytes = base64.b64decode(protobuf_b64)
+                protobuf_array = _decode_protobuf_input(raw_bytes)
+                inputs = {"input_data": protobuf_array.tolist()}
+                bt.logging.info(
+                    f"Decoded protobuf input: shape={list(protobuf_array.shape)}"
+                )
+
             circuit = circuit_store.ensure_circuit(circuit_id)
             if not self.dsperse_manager:
                 return Error(10, "DSperse manager not initialized")
@@ -418,22 +469,30 @@ class RelayManager:
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 
-            await asyncio.to_thread(self.dsperse_manager.abort_active_runs)
+            loop = asyncio.get_running_loop()
 
-            run_uid = await asyncio.to_thread(
+            await loop.run_in_executor(
+                self._relay_executor,
+                self.dsperse_manager.abort_active_runs,
+            )
+
+            run_uid = await loop.run_in_executor(
+                self._relay_executor,
                 self.dsperse_manager.start_incremental_run,
                 circuit,
                 inputs,
                 RunSource.API,
             )
 
-            threading.Thread(
-                target=self._run_onnx_background,
-                args=(run_uid, circuit, inputs),
-                daemon=True,
-            ).start()
+            if protobuf_array is not None:
+                self._spawn_onnx_process(
+                    run_uid, circuit, {"input_data": protobuf_array}
+                )
+            else:
+                self._spawn_onnx_process(run_uid, circuit, inputs)
 
-            requests = await asyncio.to_thread(
+            requests = await loop.run_in_executor(
+                self._relay_executor,
                 self.dsperse_manager.get_next_incremental_work,
                 run_uid,
             )

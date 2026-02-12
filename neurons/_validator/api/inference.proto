@@ -1,0 +1,6 @@
+syntax = "proto3";
+
+message InferenceRequest {
+  repeated float data = 1 [packed = true];
+  repeated int32 shape = 2 [packed = true];
+}
