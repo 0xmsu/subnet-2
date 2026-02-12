@@ -536,13 +536,20 @@ class IncrementalRunner:
                     break
                 meta = state.slice_metadata.get(slice_id)
                 if not meta:
+                    logging.warning(f"ONNX inference: no metadata for {slice_id}")
                     break
                 required_inputs = meta.dependencies.filtered_inputs
-                if any(i not in state.tensor_cache for i in required_inputs):
+                missing = [i for i in required_inputs if i not in state.tensor_cache]
+                if missing:
+                    logging.warning(
+                        f"ONNX inference: missing inputs {missing} for {slice_id}"
+                    )
                     break
                 self._ensure_extracted(state, slice_id)
-                self._run_onnx_locally(state, slice_id, meta)
-                self._cleanup_extracted_slice(state, slice_id)
+                try:
+                    self._run_onnx_locally(state, slice_id, meta)
+                finally:
+                    self._cleanup_extracted_slice(state, slice_id)
                 state.completed_slices.append(slice_id)
                 state.current_idx += 1
             return self.get_final_output(run_uid)

@@ -59,6 +59,7 @@ class RelayManager:
         self.dsperse_manager: DSperseManager | None = None
         self.dispatch_event: asyncio.Event | None = None
         self._onnx_outputs: dict[str, list] = {}
+        self._onnx_lock = threading.Lock()
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._connected = asyncio.Event()
@@ -357,13 +358,14 @@ class RelayManager:
             traceback.print_exc()
             return Error(9, "Request processing failed", str(e))
 
-    def _run_onnx_background(self, run_uid: str, circuit: object, inputs: dict) -> None:
+    def _run_onnx_background(self, run_uid: str, circuit, inputs: dict) -> None:
         try:
             output_tensor = self.dsperse_manager.run_onnx_inference(
                 circuit, copy.deepcopy(inputs)
             )
             if output_tensor is not None:
-                self._onnx_outputs[run_uid] = output_tensor.tolist()
+                with self._onnx_lock:
+                    self._onnx_outputs[run_uid] = output_tensor.tolist()
                 bt.logging.info(f"Background ONNX complete for run {run_uid}")
         except Exception as e:
             bt.logging.warning(f"Background ONNX failed for run {run_uid}: {e}")
@@ -393,7 +395,7 @@ class RelayManager:
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 
-            self.dsperse_manager.abort_active_runs()
+            await asyncio.to_thread(self.dsperse_manager.abort_active_runs)
 
             run_uid = await asyncio.to_thread(
                 self.dsperse_manager.start_incremental_run,
@@ -464,7 +466,8 @@ class RelayManager:
                 "status": run_status,
                 "progress": status.to_dict(),
             }
-            onnx_output = self._onnx_outputs.pop(run_uid, None)
+            with self._onnx_lock:
+                onnx_output = self._onnx_outputs.get(run_uid)
             if onnx_output is not None:
                 response["output"] = onnx_output
 
@@ -476,6 +479,8 @@ class RelayManager:
             return Error(9, "Failed to get run status", str(e))
 
     def _cleanup_run(self, run_uid: str) -> None:
+        with self._onnx_lock:
+            self._onnx_outputs.pop(run_uid, None)
         if self.dsperse_manager:
             try:
                 self.dsperse_manager.cleanup_run(run_uid)

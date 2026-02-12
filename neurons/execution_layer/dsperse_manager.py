@@ -459,13 +459,15 @@ class DSperseManager:
             active_uids = list(self._incremental_runs)
         aborted = []
         for run_uid in active_uids:
-            self._incremental_runner.abort_run(run_uid)
-            aborted.append(run_uid)
+            state = self._incremental_runner._runs.get(run_uid)
+            if state and not state.aborted and not state.is_complete:
+                self._incremental_runner.abort_run(run_uid)
+                aborted.append(run_uid)
         if aborted:
             logging.info(f"Aborted {len(aborted)} active runs for incoming request")
         return aborted
 
-    def run_onnx_inference(self, circuit: Circuit, inputs: dict) -> Any:
+    def run_onnx_inference(self, circuit: Circuit, inputs: dict) -> Optional[Any]:
         return self._incremental_runner.run_onnx_inference(circuit, inputs)
 
     _COMPLETED_STATUS_TTL_SEC = 600
@@ -764,7 +766,7 @@ class DSperseManager:
             )
             if incremental_mode and witness_data is not None:
                 result["witness"] = witness_data
-            if not success and proof_data is None:
+            if not success:
                 return result
 
             proof_generation_time = time.time() - prove_start
