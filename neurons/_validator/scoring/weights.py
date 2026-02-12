@@ -42,17 +42,23 @@ class PerformanceTracker:
         self.persistence_path = persistence_path
         self._load()
 
-    def _reference_time(self) -> float:
+    def _success_times(self) -> list[float]:
         times = []
         for w in self.windows.values():
             for success, rt in w:
                 if success and rt > 0:
                     times.append(rt)
+        return times
+
+    def _percentile_time(self, times: list[float]) -> float:
         if not times:
             return CIRCUIT_TIMEOUT_SECONDS
         times.sort()
         idx = min(int(len(times) * self.RESPONSE_TIME_PERCENTILE), len(times) - 1)
-        return max(times[idx], 1.0)
+        return times[idx]
+
+    def _reference_time(self) -> float:
+        return max(self._percentile_time(self._success_times()), 1.0)
 
     def _score(self, success: bool, response_time_sec: float, ref: float) -> float:
         if not success:
@@ -105,17 +111,11 @@ class PerformanceTracker:
 
     def adaptive_timeout(self) -> float:
         with self._lock:
-            times = []
-            for w in self.windows.values():
-                for success, rt in w:
-                    if success and rt > 0:
-                        times.append(rt)
+            times = self._success_times()
             if len(times) < self.ADAPTIVE_TIMEOUT_MIN_SAMPLES:
                 return CIRCUIT_TIMEOUT_SECONDS
-            times.sort()
-            idx = min(int(len(times) * self.RESPONSE_TIME_PERCENTILE), len(times) - 1)
             return min(
-                times[idx] * self.ADAPTIVE_TIMEOUT_MULTIPLIER,
+                self._percentile_time(times) * self.ADAPTIVE_TIMEOUT_MULTIPLIER,
                 CIRCUIT_TIMEOUT_SECONDS,
             )
 

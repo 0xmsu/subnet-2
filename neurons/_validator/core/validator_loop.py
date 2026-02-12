@@ -302,6 +302,9 @@ class ValidatorLoop:
                 requests_sent = 0
                 shuffled_uids = self.queryable_uids.copy()
                 random.shuffle(shuffled_uids)
+                adaptive_to = (
+                    self.weights_manager.performance_tracker.adaptive_timeout()
+                )
                 for uid in shuffled_uids:
                     if requests_sent >= slots_available:
                         break
@@ -338,9 +341,7 @@ class ValidatorLoop:
                             )
                             break
 
-                        request.timeout_override = (
-                            self.weights_manager.performance_tracker.adaptive_timeout()
-                        )
+                        request.timeout_override = adaptive_to
                         task_id = self._generate_task_id(uid)
 
                         if DEBUG_SYNC_MODE:
