@@ -8,6 +8,7 @@ Simple state machine:
 """
 
 import json
+import random
 import secrets
 import shutil
 import time
@@ -371,25 +372,29 @@ class IncrementalRunner:
             state.current_idx += 1
             return []
 
-        overflow_info = self._preflight_jstprove_range_check(state, slice_id, meta)
-        if overflow_info:
-            tile_detail = (
-                f" tile {overflow_info['tile_idx']}"
-                if "tile_idx" in overflow_info
-                else ""
-            )
-            logging.warning(
-                f"Slice {slice_id}{tile_detail}: {overflow_info['overflow_count']}/{overflow_info['total_elements']} "
-                f"outputs exceed JSTprove {self.JSTPROVE_N_BITS}-bit range "
-                f"(max |val|={overflow_info['max_abs']:.0f}, limit={self.JSTPROVE_RANGE_LIMIT}), "
-                f"falling back to ONNX"
-            )
-            self._cleanup_extracted_slice(state, slice_id)
-            state.completed_slices.append(slice_id)
-            state.current_idx += 1
-            if self._on_jstprove_range_fallback:
-                self._on_jstprove_range_fallback(state.run_uid, slice_id, overflow_info)
-            return []
+        if state.run_source != RunSource.API:
+            overflow_info = self._preflight_jstprove_range_check(state, slice_id, meta)
+            if overflow_info:
+                tile_detail = (
+                    f" tile {overflow_info['tile_idx']}"
+                    if "tile_idx" in overflow_info
+                    else ""
+                )
+                logging.warning(
+                    f"Slice {slice_id}{tile_detail}: "
+                    f"{overflow_info['overflow_count']}/{overflow_info['total_elements']} "
+                    f"outputs exceed JSTprove {self.JSTPROVE_N_BITS}-bit range "
+                    f"(max |val|={overflow_info['max_abs']:.0f}, limit={self.JSTPROVE_RANGE_LIMIT}), "
+                    f"falling back to ONNX"
+                )
+                self._cleanup_extracted_slice(state, slice_id)
+                state.completed_slices.append(slice_id)
+                state.current_idx += 1
+                if self._on_jstprove_range_fallback:
+                    self._on_jstprove_range_fallback(
+                        state.run_uid, slice_id, overflow_info
+                    )
+                return []
 
         return self._create_work_items(state, slice_id, meta, is_tiled)
 
@@ -906,6 +911,8 @@ class IncrementalRunner:
             self._cleanup_tile_cache(state, tiling)
         logging.info(f"Completed {tiling.num_tiles} tiles for {slice_id}")
 
+    API_SAMPLE_TILES = 2
+
     def _create_work_items(
         self, state: RunState, slice_id: str, meta: RunSliceMetadata, is_tiled: bool
     ) -> list[WorkItem]:
@@ -918,7 +925,19 @@ class IncrementalRunner:
             input_tensor = tile_executor.get_input_tensor(slice_id, tiling, meta)
             tile_executor.split_into_tiles(slice_id, tiling, input_tensor)
 
-            for tile_idx in range(tiling.num_tiles):
+            tile_indices = list(range(tiling.num_tiles))
+            if (
+                state.run_source == RunSource.API
+                and len(tile_indices) > self.API_SAMPLE_TILES
+            ):
+                tile_indices = sorted(
+                    random.sample(tile_indices, self.API_SAMPLE_TILES)
+                )
+                logging.info(
+                    f"API run: sampling tiles {tile_indices} from {tiling.num_tiles} for {slice_id}"
+                )
+
+            for tile_idx in tile_indices:
                 cache_name = f"tile_{tiling.slice_idx}_{tile_idx}_in"
                 tile_tensor = state.tensor_cache.get(cache_name)
                 if tile_tensor is None:
