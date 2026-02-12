@@ -258,6 +258,10 @@ class RelayManager:
         self._onnx_result_queue: mp.Queue = _spawn_ctx.Queue()
         self._onnx_processes: dict[str, mp.Process] = {}
         self._onnx_circuit_ids: dict[str, str] = {}
+        self._onnx_max_concurrent = 2
+        self._onnx_max_queue = 15
+        self._onnx_pending: list[tuple[str, object, dict]] = []
+        self._onnx_pending_lock = threading.Lock()
         self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
@@ -293,6 +297,7 @@ class RelayManager:
                         ).start()
 
                 self._onnx_processes.pop(run_uid, None)
+                self._drain_onnx_pending()
             except Exception as e:
                 bt.logging.warning(f"ONNX result monitor error: {e}")
 
@@ -513,6 +518,22 @@ class RelayManager:
         if input_data is None:
             return
         self._onnx_circuit_ids[run_uid] = circuit.id
+        active = len([p for p in self._onnx_processes.values() if p.is_alive()])
+        if active >= self._onnx_max_concurrent:
+            with self._onnx_pending_lock:
+                if len(self._onnx_pending) >= self._onnx_max_queue:
+                    evicted = self._onnx_pending.pop(0)
+                    bt.logging.info(
+                        f"ONNX queue full, evicting oldest run {evicted[0]}"
+                    )
+                self._onnx_pending.append((run_uid, model_path, input_data))
+            bt.logging.info(
+                f"ONNX queued for run {run_uid} ({active} active, {len(self._onnx_pending)} pending)"
+            )
+            return
+        self._start_onnx_process(run_uid, model_path, input_data)
+
+    def _start_onnx_process(self, run_uid: str, model_path, input_data) -> None:
         p = _spawn_ctx.Process(
             target=_onnx_inference_worker,
             args=(model_path, input_data, run_uid, self._onnx_result_queue),
@@ -520,6 +541,17 @@ class RelayManager:
         )
         p.start()
         self._onnx_processes[run_uid] = p
+
+    def _drain_onnx_pending(self) -> None:
+        active = len([p for p in self._onnx_processes.values() if p.is_alive()])
+        with self._onnx_pending_lock:
+            while self._onnx_pending and active < self._onnx_max_concurrent:
+                run_uid, model_path, input_data = self._onnx_pending.pop(0)
+                self._start_onnx_process(run_uid, model_path, input_data)
+                active += 1
+                bt.logging.info(
+                    f"ONNX dequeued for run {run_uid} ({active} active, {len(self._onnx_pending)} pending)"
+                )
 
     async def handle_dsperse_submit(self, **params: object) -> dict[str, object]:
         circuit_id = params.get("circuit_id")
@@ -562,28 +594,12 @@ class RelayManager:
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 
-            await loop.run_in_executor(
-                self._relay_executor,
-                self.dsperse_manager.abort_active_runs,
-            )
-
             run_uid = await loop.run_in_executor(
                 self._relay_executor,
-                self.dsperse_manager.start_incremental_run,
-                circuit,
-                inputs,
-                RunSource.API,
+                lambda: self.dsperse_manager.start_incremental_run(
+                    circuit, inputs, RunSource.API, max_tiles=1
+                ),
             )
-
-            try:
-                if protobuf_array is not None:
-                    self._spawn_onnx_process(
-                        run_uid, circuit, {"input_data": protobuf_array}
-                    )
-                else:
-                    self._spawn_onnx_process(run_uid, circuit, inputs)
-            except Exception as onnx_err:
-                bt.logging.warning(f"ONNX spawn failed (non-fatal): {onnx_err}")
 
             if self.dispatch_event:
                 self.dispatch_event.set()

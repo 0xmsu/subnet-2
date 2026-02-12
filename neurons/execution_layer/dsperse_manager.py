@@ -130,6 +130,7 @@ class DSperseManager:
         circuit: Circuit,
         inputs: dict | None = None,
         run_source: RunSource = RunSource.BENCHMARK,
+        max_tiles: int | None = None,
     ) -> str:
         """
         Start an incremental run where miners compute outputs.
@@ -137,11 +138,14 @@ class DSperseManager:
         Args:
             circuit: The circuit to execute
             inputs: Model inputs (generated if not provided)
+            max_tiles: If set, cap the run to at most this many provable tiles
 
         Returns:
             Run UID
         """
-        run_uid = self._incremental_runner.start_run(circuit, inputs, run_source)
+        run_uid = self._incremental_runner.start_run(
+            circuit, inputs, run_source, max_tiles=max_tiles
+        )
         with self._incremental_runs_lock:
             self._incremental_runs.add(run_uid)
             self._incremental_run_circuits[run_uid] = circuit.id

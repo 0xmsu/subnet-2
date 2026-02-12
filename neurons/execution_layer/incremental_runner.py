@@ -199,6 +199,7 @@ class IncrementalRunner:
         circuit: Circuit,
         inputs: Optional[dict] = None,
         run_source: RunSource = RunSource.BENCHMARK,
+        max_tiles: Optional[int] = None,
     ) -> str:
         """Start a new incremental run."""
         run_uid = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{secrets.token_hex(8)}"
@@ -273,6 +274,25 @@ class IncrementalRunner:
             start_time=time.perf_counter(),
         )
 
+        if max_tiles is not None:
+            truncated = []
+            tiles_seen = 0
+            for sid in execution_order:
+                meta = run_metadata.slices.get(sid)
+                has_circuit = meta and self._has_circuits(state, sid, meta)
+                if has_circuit:
+                    count = (
+                        meta.tiling.num_tiles
+                        if meta.tiling and meta.tiling.num_tiles > 1
+                        else 1
+                    )
+                    if tiles_seen + count > max_tiles and tiles_seen > 0:
+                        break
+                    tiles_seen += count
+                truncated.append(sid)
+            execution_order = truncated
+            state.execution_order = truncated
+
         total_tiles = 0
         slice_tile_counts: dict[str, int] = {}
         for slice_id in execution_order:
@@ -291,6 +311,7 @@ class IncrementalRunner:
         self._runs[run_uid] = state
         logging.info(
             f"Run {run_uid} initialized with {len(execution_order)} slices, {total_tiles} tiles"
+            + (f" (capped at max_tiles={max_tiles})" if max_tiles is not None else "")
         )
         return run_uid
 
