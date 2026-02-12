@@ -8,6 +8,7 @@ import copy
 import json
 import multiprocessing as mp
 import os
+import queue
 import threading
 import traceback
 
@@ -24,7 +25,6 @@ from jsonrpcserver import (
     Success,
     async_dispatch,
 )
-from websockets.exceptions import ConnectionClosed
 
 from _validator.api.inference_pb2 import InferenceRequest
 from _validator.config import ValidatorConfig
@@ -72,21 +72,97 @@ def _onnx_inference_worker(
         result_queue.put((run_uid, None, str(exc)))
 
 
-class AuthenticationError(Exception):
-    """Raised when authentication with the relay fails."""
+def _relay_ws_process(
+    relay_url: str,
+    wallet,
+    inbox: mp.Queue,
+    outbox: mp.Queue,
+):
+    import signal
 
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    async def _run():
+        reconnect_delay = RELAY_RECONNECT_BASE_DELAY
+        while True:
+            try:
+                async with websockets.connect(
+                    relay_url,
+                    open_timeout=RELAY_OPEN_TIMEOUT,
+                    ping_interval=20,
+                    ping_timeout=None,
+                    max_size=100 * 1024 * 1024,
+                ) as ws:
+                    raw_msg = await asyncio.wait_for(
+                        ws.recv(), timeout=RELAY_AUTH_TIMEOUT
+                    )
+                    msg = json.loads(raw_msg)
+                    if msg.get("type") != "auth_challenge":
+                        continue
+                    challenge_bytes = base64.b64decode(msg["challenge"], validate=True)
+                    signature = wallet.hotkey.sign(challenge_bytes)
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "auth_response",
+                                "ss58": wallet.hotkey.ss58_address,
+                                "signature": base64.b64encode(signature).decode(),
+                            }
+                        )
+                    )
+                    raw_result = await asyncio.wait_for(
+                        ws.recv(), timeout=RELAY_AUTH_TIMEOUT
+                    )
+                    if json.loads(raw_result).get("type") != "auth_success":
+                        continue
+
+                    bt.logging.success("Relay WS process: connected and authenticated")
+                    reconnect_delay = RELAY_RECONNECT_BASE_DELAY
+
+                    async def _reader():
+                        async for message in ws:
+                            inbox.put(message)
+
+                    async def _writer():
+                        loop = asyncio.get_running_loop()
+                        while ws.close_code is None:
+                            try:
+                                msg = await asyncio.wait_for(
+                                    loop.run_in_executor(
+                                        None, lambda: outbox.get(timeout=0.5)
+                                    ),
+                                    timeout=2.0,
+                                )
+                                await ws.send(msg)
+                            except (asyncio.TimeoutError, queue.Empty):
+                                continue
+
+                    done, pending = await asyncio.wait(
+                        {
+                            asyncio.create_task(_reader()),
+                            asyncio.create_task(_writer()),
+                        },
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+            except Exception as e:
+                bt.logging.warning(f"Relay WS process error: {e}")
+
+            bt.logging.info(f"Relay WS process: reconnecting in {reconnect_delay}s")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, RELAY_RECONNECT_MAX_DELAY)
+
+    asyncio.run(_run())
+
+
+class AuthenticationError(Exception):
     pass
 
 
 class RelayManager:
-    """
-    WebSocket client that connects to the SN2 Relay service.
-
-    Maintains a persistent connection, handles authentication,
-    processes incoming JSON-RPC requests, and sends batch completion
-    notifications with generated proofs.
-    """
-
     def __init__(self, config: ValidatorConfig):
         self.config = config
         self.stacked_requests_queue: asyncio.Queue = asyncio.Queue()
@@ -103,12 +179,10 @@ class RelayManager:
         self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._connected = asyncio.Event()
+        self._ws_inbox: mp.Queue = mp.Queue()
+        self._ws_outbox: mp.Queue = mp.Queue()
+        self._ws_process: mp.Process | None = None
         self._should_run = True
-        self._reconnect_delay = RELAY_RECONNECT_BASE_DELAY
-
-        self._pending_notifications: list[dict] = []
         self._task: asyncio.Task | None = None
 
     def _monitor_onnx_results(self) -> None:
@@ -130,15 +204,25 @@ class RelayManager:
                 bt.logging.warning(f"ONNX result monitor error: {e}")
 
     def start(self) -> None:
-        """Start the WebSocket client connection (called from ValidatorLoop)."""
         if not self.config.relay_enabled:
             bt.logging.info(
                 "Relay client disabled: --ignore-external-requests flag present"
             )
             return
 
-        bt.logging.info("Starting SN2 Relay client...")
-        self._task = asyncio.create_task(self._run())
+        bt.logging.info("Starting SN2 Relay (isolated WS process)...")
+        self._ws_process = mp.Process(
+            target=_relay_ws_process,
+            args=(
+                self.config.relay_url,
+                self.config.wallet,
+                self._ws_inbox,
+                self._ws_outbox,
+            ),
+            daemon=True,
+        )
+        self._ws_process.start()
+        self._task = asyncio.create_task(self._dispatch_loop())
         self._task.add_done_callback(self._on_task_done)
 
     def _on_task_done(self, task: asyncio.Task) -> None:
@@ -146,127 +230,20 @@ class RelayManager:
             return
         exc = task.exception()
         if exc:
-            bt.logging.error(f"Relay task failed with exception: {exc}")
+            bt.logging.error(f"Relay dispatch loop failed: {exc}")
 
-    async def _run(self) -> None:
-        """Main run loop with reconnection."""
+    async def _dispatch_loop(self) -> None:
+        loop = asyncio.get_running_loop()
         while self._should_run:
             try:
-                await self._connect_and_handle()
-            except AuthenticationError as e:
-                bt.logging.error(f"Relay authentication failed: {e}")
-            except ConnectionClosed as e:
-                bt.logging.warning(f"Relay connection closed: {e}")
-            except Exception as e:
-                bt.logging.error(f"Relay connection error: {e}")
-                traceback.print_exc()
-
-            if self._should_run:
-                await self._handle_reconnect()
-
-    async def _connect_and_handle(self) -> None:
-        """Connect, authenticate, and handle messages."""
-        bt.logging.info(f"Connecting to SN2 Relay at {self.config.relay_url}...")
-
-        try:
-            async with websockets.connect(
-                self.config.relay_url,
-                open_timeout=RELAY_OPEN_TIMEOUT,
-                ping_interval=20,
-                ping_timeout=None,
-                max_size=100 * 1024 * 1024,
-            ) as ws:
-                bt.logging.debug("WebSocket handshake completed")
-                self._ws = ws
-                await self._authenticate(ws)
-                bt.logging.success("Connected and authenticated to SN2 Relay")
-                self._connected.set()
-                self._reconnect_delay = RELAY_RECONNECT_BASE_DELAY
-
-                await self._flush_pending_notifications(ws)
-
-                message_task = asyncio.create_task(self._message_loop(ws))
-                notify_task = asyncio.create_task(self._notification_sender_loop(ws))
-                done, pending = await asyncio.wait(
-                    {message_task, notify_task},
-                    return_when=asyncio.FIRST_COMPLETED,
+                message = await loop.run_in_executor(
+                    self._relay_executor,
+                    lambda: self._ws_inbox.get(timeout=1.0),
                 )
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-        except asyncio.TimeoutError as e:
-            bt.logging.error(f"WS Connection timeout: {e}")
-            raise
+            except queue.Empty:
+                continue
 
-    async def _handle_reconnect(self) -> None:
-        """Handle reconnection with exponential backoff."""
-        self._connected.clear()
-        self._ws = None
-        bt.logging.warning(f"Reconnecting to SN2 Relay in {self._reconnect_delay}s...")
-        await asyncio.sleep(self._reconnect_delay)
-        self._reconnect_delay = min(
-            self._reconnect_delay * 2,
-            RELAY_RECONNECT_MAX_DELAY,
-        )
-
-    async def _authenticate(self, ws: websockets.WebSocketClientProtocol) -> None:
-        """
-        Handle auth challenge/response flow per VALIDATOR_INTEGRATION.md.
-
-        1. Receive auth_challenge with 40 bytes (32 nonce + 8 timestamp)
-        2. Sign challenge bytes with validator's sr25519 keypair
-        3. Send auth_response with SS58 address and signature
-        4. Receive auth_success or connection close
-        """
-        # Receive challenge
-        try:
-            bt.logging.info(
-                f"Authenticating with SN2 Relay (ss58:{self.config.wallet.hotkey.ss58_address})..."
-            )
-            raw_msg = await asyncio.wait_for(ws.recv(), timeout=RELAY_AUTH_TIMEOUT)
-        except asyncio.TimeoutError:
-            bt.logging.error("Timeout waiting for auth_challenge from relay")
-            raise AuthenticationError("Timeout waiting for auth_challenge")
-        msg = json.loads(raw_msg)
-
-        if msg.get("type") != "auth_challenge":
-            raise AuthenticationError(f"Expected auth_challenge, got {msg.get('type')}")
-
-        try:
-            challenge_bytes = base64.b64decode(msg["challenge"], validate=True)
-        except Exception as e:
-            raise AuthenticationError("Invalid auth_challenge payload") from e
-
-        if len(challenge_bytes) != 40:
-            raise AuthenticationError(
-                f"Invalid auth_challenge length: {len(challenge_bytes)}"
-            )
-
-        # Sign with validator's sr25519 keypair
-        signature = self.config.wallet.hotkey.sign(challenge_bytes)
-
-        # Send response
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "auth_response",
-                    "ss58": self.config.wallet.hotkey.ss58_address,
-                    "signature": base64.b64encode(signature).decode(),
-                }
-            )
-        )
-
-        # Wait for success
-        raw_result = await asyncio.wait_for(ws.recv(), timeout=RELAY_AUTH_TIMEOUT)
-        result = json.loads(raw_result)
-
-        if result.get("type") != "auth_success":
-            raise AuthenticationError("Authentication failed")
-
-    async def _message_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
-        """Handle incoming JSON-RPC messages from relay."""
-        async for message in ws:
-            bt.logging.debug(f"Received relay message: {message[:100]}...")
+            bt.logging.debug(f"Received relay message: {str(message)[:100]}...")
             try:
                 response = await async_dispatch(
                     message,
@@ -276,45 +253,22 @@ class RelayManager:
                         "subnet-2.run_status": self.handle_run_status,
                     },
                 )
-                await ws.send(str(response))
+                self._ws_outbox.put(str(response))
             except Exception as e:
                 bt.logging.error(f"Error processing relay message: {e}")
                 traceback.print_exc()
                 request_id = None
                 with contextlib.suppress(Exception):
                     request_id = json.loads(message).get("id")
-                error_response = json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "error": {"code": -32603, "message": str(e)},
-                        "id": request_id,
-                    }
+                self._ws_outbox.put(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32603, "message": str(e)},
+                            "id": request_id,
+                        }
+                    )
                 )
-                await ws.send(error_response)
-
-    async def _notification_sender_loop(
-        self, ws: websockets.WebSocketClientProtocol
-    ) -> None:
-        """Periodically flush queued notifications while connected."""
-        while self._should_run and ws.close_code is None:
-            await self._flush_pending_notifications(ws)
-            await asyncio.sleep(1)
-
-    async def _flush_pending_notifications(
-        self, ws: websockets.WebSocketClientProtocol
-    ) -> None:
-        """Send any queued notifications after reconnecting."""
-        while self._pending_notifications and ws.close_code is None:
-            notification = self._pending_notifications.pop(0)
-            try:
-                await ws.send(json.dumps(notification))
-                bt.logging.info(
-                    f"Sent queued notification: {notification.get('method')}"
-                )
-            except Exception as e:
-                bt.logging.error(f"Failed to send queued notification: {e}")
-                self._pending_notifications.insert(0, notification)
-                break
 
     def on_api_run_complete(
         self,
@@ -332,24 +286,21 @@ class RelayManager:
                 daemon=True,
             ).start()
 
-        self._pending_notifications.append(
-            {
-                "jsonrpc": "2.0",
-                "method": "subnet-2.batch_completed",
-                "params": {
-                    "run_uid": run_uid,
-                    "circuit_id": circuit_id,
-                    "status": "completed" if success else "completed_with_errors",
-                },
-            }
+        self._ws_outbox.put(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "subnet-2.batch_completed",
+                    "params": {
+                        "run_uid": run_uid,
+                        "circuit_id": circuit_id,
+                        "status": "completed" if success else "completed_with_errors",
+                    },
+                }
+            )
         )
 
     async def handle_proof_of_computation(self, **params: dict) -> dict:
-        """
-        Handle subnet-2.proof_of_computation RPC method.
-
-        Queues a proof generation request and waits for completion.
-        """
         input_json = params.get("input")
         circuit_id = params.get("circuit")
 
@@ -597,23 +548,17 @@ class RelayManager:
         bt.logging.info(f"Run {run_uid} completed and cleaned up")
 
     async def stop(self) -> None:
-        """Gracefully shutdown the WebSocket client."""
         bt.logging.info("Stopping SN2 Relay client...")
         self._should_run = False
-        self._connected.clear()
         if self._task:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception as e:
-                bt.logging.debug(f"Error closing websocket: {e}")
-        self._ws = None
+        if self._ws_process and self._ws_process.is_alive():
+            self._ws_process.terminate()
+            self._ws_process.join(timeout=5)
 
     def set_request_result(self, request_hash: str, result: dict) -> None:
-        """Set the result for a pending request and signal its completion."""
         if request_hash in self.pending_requests:
             self.request_results[request_hash] = result
             self.pending_requests[request_hash].set()
