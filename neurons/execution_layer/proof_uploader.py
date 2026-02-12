@@ -104,6 +104,21 @@ def upload_final_output(
     return result.get("gcs_key")
 
 
+def upload_input_frame(run_uid: str, frame_bytes: bytes) -> Optional[str]:
+    api_url = _get_api_url()
+    hotkey = _get_wallet().hotkey.ss58_address
+    payload = {"validator_key": hotkey, "run_uid": run_uid}
+    result = _authenticated_post(
+        f"{api_url}/proofs/{run_uid}/frame-upload-url", payload
+    )
+    upload_url = result.get("upload_url")
+    if not upload_url:
+        return None
+    with httpx.Client(timeout=60.0) as client:
+        upload_artifact_bytes(client, upload_url, frame_bytes)
+    return result.get("gcs_key")
+
+
 def upload_run_proofs(
     run_uid: str,
     circuit_id: str,

@@ -5,6 +5,7 @@ import base64
 import concurrent.futures
 import contextlib
 import copy
+import io
 import json
 import multiprocessing as mp
 import os
@@ -19,7 +20,11 @@ import onnxruntime as ort
 import websockets
 from deployment_layer.circuit_store import circuit_store
 from execution_layer.dsperse_manager import DSperseManager
-from execution_layer.proof_uploader import upload_final_output, upload_run_proofs
+from execution_layer.proof_uploader import (
+    upload_final_output,
+    upload_input_frame,
+    upload_run_proofs,
+)
 from jsonrpcserver import (
     Error,
     InvalidParams,
@@ -109,6 +114,20 @@ def _yolo_nms(
     ]
 
 
+def _encode_nchw_to_jpeg(arr: np.ndarray) -> bytes:
+    from PIL import Image
+
+    img = arr[0].transpose(1, 2, 0)
+    if img.max() <= 1.0:
+        img = (img * 255).clip(0, 255)
+    img = img.astype(np.uint8)
+    if img.shape[2] == 1:
+        img = img[:, :, 0]
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
 def _onnx_inference_worker(
     model_path: str, input_data, run_uid: str, result_queue: mp.Queue
 ):
@@ -128,7 +147,8 @@ def _onnx_inference_worker(
         result = sess.run(None, {input_name: arr})
         img_h, img_w = arr.shape[2], arr.shape[3]
         detections = _yolo_nms(result[0], img_h=img_h, img_w=img_w)
-        result_queue.put((run_uid, detections))
+        frame_jpeg = _encode_nchw_to_jpeg(arr)
+        result_queue.put((run_uid, detections, frame_jpeg))
     except Exception as exc:
         result_queue.put((run_uid, None, str(exc)))
 
@@ -251,13 +271,15 @@ class RelayManager:
         while True:
             try:
                 msg = self._onnx_result_queue.get()
-                if len(msg) == 3:
-                    run_uid, _, err = msg
+                run_uid = msg[0]
+                if msg[1] is None:
+                    err = msg[2]
                     bt.logging.warning(
                         f"Full-model ONNX failed for run {run_uid}: {err}"
                     )
                 else:
-                    run_uid, output = msg
+                    output = msg[1]
+                    frame_jpeg = msg[2] if len(msg) > 2 else None
                     with self._onnx_lock:
                         self._onnx_outputs[run_uid] = (time.monotonic(), output)
                     bt.logging.info(f"Full-model ONNX complete for run {run_uid}")
@@ -266,7 +288,7 @@ class RelayManager:
                     if output and circuit_id:
                         threading.Thread(
                             target=self._upload_onnx_output,
-                            args=(run_uid, circuit_id, output),
+                            args=(run_uid, circuit_id, output, frame_jpeg),
                             daemon=True,
                         ).start()
 
@@ -274,12 +296,24 @@ class RelayManager:
             except Exception as e:
                 bt.logging.warning(f"ONNX result monitor error: {e}")
 
-    def _upload_onnx_output(self, run_uid: str, circuit_id: str, output: list) -> None:
+    def _upload_onnx_output(
+        self,
+        run_uid: str,
+        circuit_id: str,
+        output: list,
+        frame_jpeg: bytes | None = None,
+    ) -> None:
         try:
             upload_final_output(run_uid, circuit_id, {"detections": output})
             bt.logging.info(f"Uploaded ONNX output for run {run_uid}")
         except Exception as e:
             bt.logging.warning(f"Failed to upload ONNX output for {run_uid}: {e}")
+        if frame_jpeg:
+            try:
+                upload_input_frame(run_uid, frame_jpeg)
+                bt.logging.info(f"Uploaded input frame for run {run_uid}")
+            except Exception as e:
+                bt.logging.warning(f"Failed to upload input frame for {run_uid}: {e}")
 
     def _evict_stale_onnx_outputs(self) -> None:
         cutoff = time.monotonic() - _ONNX_OUTPUT_TTL_SEC
