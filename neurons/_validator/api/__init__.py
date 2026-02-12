@@ -509,6 +509,9 @@ class RelayManager:
             return Error(11, "Run not found", f"No run with ID {run_uid}")
 
         try:
+            with self._onnx_lock:
+                onnx_output = self._onnx_outputs.get(run_uid)
+
             if status.is_complete:
                 run_status = (
                     "completed" if status.all_successful else "completed_with_errors"
@@ -522,8 +525,6 @@ class RelayManager:
                 "status": run_status,
                 "progress": status.to_dict(),
             }
-            with self._onnx_lock:
-                onnx_output = self._onnx_outputs.get(run_uid)
             if onnx_output is not None:
                 response["output"] = onnx_output
 
