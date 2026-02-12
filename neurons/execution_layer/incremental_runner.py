@@ -8,6 +8,7 @@ Simple state machine:
 """
 
 import json
+import random
 import secrets
 import shutil
 import time
@@ -113,6 +114,7 @@ class RunState:
     run_source: RunSource = RunSource.BENCHMARK
     start_time: float = 0.0
     aborted: bool = False
+    max_tiles: Optional[int] = None
 
     @property
     def current_slice_id(self) -> Optional[str]:
@@ -272,26 +274,8 @@ class IncrementalRunner:
             slice_metadata={k: v for k, v in run_metadata.slices.items()},
             run_source=run_source,
             start_time=time.perf_counter(),
+            max_tiles=max_tiles,
         )
-
-        if max_tiles is not None:
-            truncated = []
-            tiles_seen = 0
-            for sid in execution_order:
-                meta = run_metadata.slices.get(sid)
-                has_circuit = meta and self._has_circuits(state, sid, meta)
-                if has_circuit:
-                    count = (
-                        meta.tiling.num_tiles
-                        if meta.tiling and meta.tiling.num_tiles > 1
-                        else 1
-                    )
-                    if tiles_seen + count > max_tiles and tiles_seen > 0:
-                        break
-                    tiles_seen += count
-                truncated.append(sid)
-            execution_order = truncated
-            state.execution_order = truncated
 
         total_tiles = 0
         slice_tile_counts: dict[str, int] = {}
@@ -311,7 +295,11 @@ class IncrementalRunner:
         self._runs[run_uid] = state
         logging.info(
             f"Run {run_uid} initialized with {len(execution_order)} slices, {total_tiles} tiles"
-            + (f" (capped at max_tiles={max_tiles})" if max_tiles is not None else "")
+            + (
+                f" (random {max_tiles} tiles per slice)"
+                if max_tiles is not None
+                else ""
+            )
         )
         return run_uid
 
@@ -463,7 +451,8 @@ class IncrementalRunner:
 
             try:
                 if meta and meta.tiling and meta.tiling.num_tiles > 1:
-                    self._reconstruct_from_tiles(state, slice_id, meta.tiling)
+                    if state.max_tiles is None:
+                        self._reconstruct_from_tiles(state, slice_id, meta.tiling)
                     self._cleanup_tile_cache(state, meta.tiling)
                 self._cleanup_extracted_slice(state, slice_id)
                 state.completed_slices.append(slice_id)
@@ -916,11 +905,24 @@ class IncrementalRunner:
             input_tensor = tile_executor.get_input_tensor(slice_id, tiling, meta)
             tile_executor.split_into_tiles(slice_id, tiling, input_tensor)
 
-            for tile_idx in range(tiling.num_tiles):
+            all_tile_indices = list(range(tiling.num_tiles))
+            if state.max_tiles is not None and state.max_tiles < tiling.num_tiles:
+                prove_indices = set(random.sample(all_tile_indices, state.max_tiles))
+                logging.info(
+                    f"Randomly selected tiles {sorted(prove_indices)} "
+                    f"out of {tiling.num_tiles} for {slice_id}"
+                )
+            else:
+                prove_indices = set(all_tile_indices)
+
+            for tile_idx in all_tile_indices:
                 cache_name = f"tile_{tiling.slice_idx}_{tile_idx}_in"
                 tile_tensor = state.tensor_cache.get(cache_name)
                 if tile_tensor is None:
                     logging.error(f"Missing tile input {cache_name}")
+                    continue
+
+                if tile_idx not in prove_indices:
                     continue
 
                 task_id = f"{slice_id}_tile_{tile_idx}"
