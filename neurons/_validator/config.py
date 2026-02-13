@@ -58,6 +58,9 @@ class ValidatorConfig:
         )
         self.api_miners_pct = getattr(self.bt_config, "api_miners_pct", 20)
         self.disable_benchmark = getattr(self.bt_config, "disable_benchmark", False)
+        self.max_benchmark_concurrent = getattr(
+            self.bt_config, "max_benchmark_concurrent", 0
+        )
 
     def check_register(self):
         """

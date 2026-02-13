@@ -125,6 +125,8 @@ class ValidatorLoop:
 
         self.request_queue = asyncio.Queue()
         self.active_tasks: dict[str, asyncio.Task | None] = {}
+        self.benchmark_in_flight = 0
+        self._api_task_ids: set[str] = set()
         self.miner_active_count: dict[int, int] = {}
         self.miner_capacities: dict[int, int] = {}
         self._uid_hotkeys: dict[int, str] = {}
@@ -392,7 +394,11 @@ class ValidatorLoop:
                             if not request:
                                 self.relay.api_requests_queue.put_nowait(next_req)
                                 continue
-                        elif not self.relay.stacked_requests_queue.empty():
+                        elif not self.relay.stacked_requests_queue.empty() and (
+                            not self.config.max_benchmark_concurrent
+                            or self.benchmark_in_flight
+                            < self.config.max_benchmark_concurrent
+                        ):
                             next_req = self.relay.stacked_requests_queue.get_nowait()
                             request = self.request_pipeline._prepare_queued_request(
                                 uid, next_req
@@ -403,12 +409,15 @@ class ValidatorLoop:
                         else:
                             break
 
+                        is_api = _is_api_request(request)
                         request.timeout_override = (
-                            API_TIMEOUT_SECONDS
-                            if _is_api_request(request)
-                            else adaptive_to
+                            API_TIMEOUT_SECONDS if is_api else adaptive_to
                         )
                         task_id = self._generate_task_id(uid)
+                        if is_api:
+                            self._api_task_ids.add(task_id)
+                        else:
+                            self.benchmark_in_flight += 1
 
                         if DEBUG_SYNC_MODE:
                             bt.logging.debug(
@@ -457,6 +466,11 @@ class ValidatorLoop:
     def _handle_completed_task(self, task_id: str, uid: int):
         if task_id in self.active_tasks:
             del self.active_tasks[task_id]
+
+        if task_id in self._api_task_ids:
+            self._api_task_ids.discard(task_id)
+        else:
+            self.benchmark_in_flight = max(0, self.benchmark_in_flight - 1)
 
         if uid in self.miner_active_count:
             self.miner_active_count[uid] = max(0, self.miner_active_count[uid] - 1)

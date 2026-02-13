@@ -338,6 +338,13 @@ def _validator_config():
         help="Disable benchmark proof-of-weights requests.",
     )
 
+    parser.add_argument(
+        "--max-benchmark-concurrent",
+        type=int,
+        default=0,
+        help="Maximum concurrent benchmark (non-API) requests. 0 = unlimited (default: 0).",
+    )
+
     bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
     bt.Wallet.add_args(parser)
