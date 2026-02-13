@@ -490,6 +490,9 @@ class IncrementalRunner:
                 state.current_idx += 1
                 state.failed_tasks.clear()
 
+                if is_api_sampled:
+                    state.current_idx = len(state.execution_order)
+
                 if state.is_complete:
                     self._on_complete(state)
             except Exception as e:
