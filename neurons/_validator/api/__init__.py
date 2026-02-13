@@ -155,13 +155,17 @@ def _onnx_inference_worker(
 
 def _relay_ws_process(
     relay_url: str,
-    wallet,
+    wallet_name: str,
+    wallet_hotkey: str,
     inbox: mp.Queue,
     outbox: mp.Queue,
 ):
     import signal
 
+    import bittensor as bt
+
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    wallet = bt.Wallet(name=wallet_name, hotkey=wallet_hotkey)
 
     async def _run():
         reconnect_delay = RELAY_RECONNECT_BASE_DELAY
@@ -265,8 +269,8 @@ class RelayManager:
         self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
-        self._ws_inbox: mp.Queue = mp.Queue()
-        self._ws_outbox: mp.Queue = mp.Queue()
+        self._ws_inbox: mp.Queue = _spawn_ctx.Queue()
+        self._ws_outbox: mp.Queue = _spawn_ctx.Queue()
         self._ws_process: mp.Process | None = None
         self._should_run = True
         self._task: asyncio.Task | None = None
@@ -327,6 +331,20 @@ class RelayManager:
             for k in stale:
                 del self._onnx_outputs[k]
 
+    def _start_ws_process(self) -> None:
+        self._ws_process = _spawn_ctx.Process(
+            target=_relay_ws_process,
+            args=(
+                self.config.relay_url,
+                self.config.wallet.name,
+                self.config.wallet.hotkey_str,
+                self._ws_inbox,
+                self._ws_outbox,
+            ),
+            daemon=True,
+        )
+        self._ws_process.start()
+
     def start(self) -> None:
         if not self.config.relay_enabled:
             bt.logging.info(
@@ -334,18 +352,8 @@ class RelayManager:
             )
             return
 
-        bt.logging.info("Starting SN2 Relay (isolated WS process)...")
-        self._ws_process = mp.Process(
-            target=_relay_ws_process,
-            args=(
-                self.config.relay_url,
-                self.config.wallet,
-                self._ws_inbox,
-                self._ws_outbox,
-            ),
-            daemon=True,
-        )
-        self._ws_process.start()
+        bt.logging.info("Starting SN2 Relay (spawn WS process)...")
+        self._start_ws_process()
         self._task = asyncio.create_task(self._dispatch_loop())
         self._task.add_done_callback(self._on_task_done)
 
@@ -356,8 +364,18 @@ class RelayManager:
         if exc:
             bt.logging.error(f"Relay dispatch loop failed: {exc}")
 
+    def _check_ws_process_health(self) -> None:
+        if self._ws_process and not self._ws_process.is_alive():
+            exit_code = self._ws_process.exitcode
+            bt.logging.warning(
+                f"Relay WS process died (exit code {exit_code}), restarting..."
+            )
+            self._ws_process.close()
+            self._start_ws_process()
+
     async def _dispatch_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        health_check_counter = 0
         while self._should_run:
             try:
                 message = await loop.run_in_executor(
@@ -365,6 +383,10 @@ class RelayManager:
                     lambda: self._ws_inbox.get(timeout=1.0),
                 )
             except queue.Empty:
+                health_check_counter += 1
+                if health_check_counter >= 10:
+                    health_check_counter = 0
+                    self._check_ws_process_health()
                 continue
 
             bt.logging.debug(f"Received relay message: {str(message)[:100]}...")
