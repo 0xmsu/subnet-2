@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import bittensor as bt
 import torch
 from bittensor import logging
 from deployment_layer.circuit_store import circuit_store
@@ -714,7 +715,8 @@ class DSperseManager:
 
     def _get_validator_hotkey(self) -> str:
         try:
-            return cli_parser.config.wallet.hotkey.ss58_address
+            wallet = bt.Wallet(config=cli_parser.config)
+            return wallet.hotkey.ss58_address
         except Exception:
             return "unknown"
 
@@ -722,7 +724,7 @@ class DSperseManager:
         try:
             import hashlib
 
-            wallet = cli_parser.config.wallet
+            wallet = bt.Wallet(config=cli_parser.config)
             message = hashlib.sha256(body.encode()).hexdigest()
             signature = wallet.hotkey.sign(message.encode())
             return signature.hex()
