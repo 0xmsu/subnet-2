@@ -1,5 +1,4 @@
 import asyncio
-import fcntl
 import json
 import os
 import random
@@ -52,6 +51,10 @@ class _RunTiming:
     slices: list[_SliceMetric] = field(default_factory=list)
 
 
+_extraction_locks: dict[str, threading.Lock] = {}
+_extraction_locks_guard = threading.Lock()
+
+
 class DSperseManager:
     def __init__(
         self,
@@ -75,6 +78,13 @@ class DSperseManager:
         self._purge_old_runs()
 
     @staticmethod
+    def _get_extraction_lock(key: str) -> threading.Lock:
+        with _extraction_locks_guard:
+            if key not in _extraction_locks:
+                _extraction_locks[key] = threading.Lock()
+            return _extraction_locks[key]
+
+    @staticmethod
     def _ensure_slice_extracted(base_path: Path, slice_id: str) -> bool:
         slice_dir = base_path / slice_id
         if slice_dir.exists():
@@ -82,13 +92,13 @@ class DSperseManager:
         dslice_path = base_path / f"{slice_id}.dslice"
         if not dslice_path.exists():
             return False
-        lock_path = base_path / f".{slice_id}.lock"
-        with open(lock_path, "w") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        lock_key = str(base_path / slice_id)
+        lock = DSperseManager._get_extraction_lock(lock_key)
+        with lock:
+            if slice_dir.exists():
+                return True
+            staging_dir = base_path / f".{slice_id}.staging"
             try:
-                if slice_dir.exists():
-                    return True
-                staging_dir = base_path / f".{slice_id}.staging"
                 if staging_dir.exists():
                     shutil.rmtree(staging_dir)
                 logging.info(f"Extracting {slice_id} from {dslice_path}")
@@ -96,9 +106,16 @@ class DSperseManager:
                 os.rename(str(staging_dir / slice_id), str(slice_dir))
                 shutil.rmtree(staging_dir, ignore_errors=True)
                 return True
+            except OSError as e:
+                if slice_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    return True
+                logging.error(f"Failed to extract {slice_id} from {dslice_path}: {e}")
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                return False
             except Exception as e:
                 logging.error(f"Failed to extract {slice_id} from {dslice_path}: {e}")
-                staging_dir = base_path / f".{slice_id}.staging"
                 if staging_dir.exists():
                     shutil.rmtree(staging_dir, ignore_errors=True)
                 if slice_dir.exists():
