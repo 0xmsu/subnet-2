@@ -8,10 +8,11 @@ import torch
 import bittensor as bt
 from constants import (
     CIRCUIT_TIMEOUT_SECONDS,
+    MAX_MINER_CAPACITY,
     PERFORMANCE_CURVE_POWER,
     PERFORMANCE_MIN_SAMPLES,
     PERFORMANCE_RESCHEDULE_PENALTY,
-    PERFORMANCE_RESPONSE_TIME_WEIGHT,
+    PERFORMANCE_SCORING_PERCENTILE,
     PERFORMANCE_WINDOW_SIZE,
     WEIGHT_RATE_LIMIT,
     WEIGHTS_VERSION,
@@ -50,23 +51,36 @@ class PerformanceTracker:
                     times.append(rt)
         return times
 
-    def _percentile_time(self, times: list[float]) -> float:
+    def _percentile_time(
+        self, times: list[float], percentile: float | None = None
+    ) -> float:
         if not times:
             return CIRCUIT_TIMEOUT_SECONDS
         times.sort()
-        idx = min(int(len(times) * self.RESPONSE_TIME_PERCENTILE), len(times) - 1)
+        p = percentile if percentile is not None else self.RESPONSE_TIME_PERCENTILE
+        idx = min(int(len(times) * p), len(times) - 1)
         return times[idx]
 
-    def _reference_time(self) -> float:
-        return max(self._percentile_time(self._success_times()), 1.0)
+    def _scoring_reference_time(self) -> float:
+        return max(
+            self._percentile_time(
+                self._success_times(), PERFORMANCE_SCORING_PERCENTILE
+            ),
+            1.0,
+        )
+
+    def _timeout_reference_time(self) -> float:
+        return max(
+            self._percentile_time(self._success_times(), self.RESPONSE_TIME_PERCENTILE),
+            1.0,
+        )
 
     def _score(self, success: bool, response_time_sec: float, ref: float) -> float:
         if not success:
             return 0.0
-        time_factor = max(0.0, 1.0 - (response_time_sec / ref))
-        return PERFORMANCE_RESPONSE_TIME_WEIGHT * time_factor + (
-            1.0 - PERFORMANCE_RESPONSE_TIME_WEIGHT
-        )
+        if response_time_sec <= 0:
+            return 2.0
+        return min(ref / response_time_sec, 2.0)
 
     def record(
         self,
@@ -100,7 +114,7 @@ class PerformanceTracker:
         with self._lock:
             if uid not in self.windows or len(self.windows[uid]) == 0:
                 return 0.0
-            ref = self._reference_time()
+            ref = self._scoring_reference_time()
             return self._uid_rate(self.windows[uid], ref)
 
     def sample_count(self, uid: int) -> int:
@@ -114,32 +128,48 @@ class PerformanceTracker:
             times = self._success_times()
             if len(times) < self.ADAPTIVE_TIMEOUT_MIN_SAMPLES:
                 return CIRCUIT_TIMEOUT_SECONDS
+            p95 = self._percentile_time(times, self.RESPONSE_TIME_PERCENTILE)
             return min(
-                self._percentile_time(times) * self.ADAPTIVE_TIMEOUT_MULTIPLIER,
+                p95 * self.ADAPTIVE_TIMEOUT_MULTIPLIER,
                 CIRCUIT_TIMEOUT_SECONDS,
             )
 
     def snapshot(self) -> dict[int, tuple[float, int]]:
         with self._lock:
-            ref = self._reference_time()
+            ref = self._scoring_reference_time()
             return {
                 uid: (self._uid_rate(w, ref), len(w)) for uid, w in self.windows.items()
             }
 
+    def _compute_capacity(self, rate: float, count: int, max_capacity: int) -> int:
+        if count < PERFORMANCE_MIN_SAMPLES:
+            return 1
+        confidence = min(count / 50.0, 1.0)
+        raw = 1 + (max_capacity - 1) * rate * confidence
+        return max(1, min(max_capacity, int(raw)))
+
     def miner_capacities(self, max_capacity: int) -> dict[int, int]:
         with self._lock:
-            ref = self._reference_time()
-            capacities = {}
+            ref = self._scoring_reference_time()
+            return {
+                uid: self._compute_capacity(
+                    self._uid_rate(w, ref), len(w), max_capacity
+                )
+                for uid, w in self.windows.items()
+            }
+
+    def throughput_snapshot(
+        self, max_capacity: int
+    ) -> dict[int, tuple[float, int, int]]:
+        with self._lock:
+            ref = self._scoring_reference_time()
+            result = {}
             for uid, w in self.windows.items():
                 count = len(w)
-                if count < PERFORMANCE_MIN_SAMPLES:
-                    capacities[uid] = 1
-                    continue
                 rate = self._uid_rate(w, ref)
-                confidence = min(count / 50.0, 1.0)
-                raw = 1 + (max_capacity - 1) * rate * confidence
-                capacities[uid] = max(1, int(raw))
-            return capacities
+                cap = self._compute_capacity(rate, count, max_capacity)
+                result[uid] = (rate, cap, count)
+            return result
 
     def reset_uid(self, uid: int) -> None:
         with self._lock:
@@ -245,18 +275,17 @@ class WeightsManager:
 
         return True, ""
 
-    def _compute_performance_weights(self, scores: torch.Tensor) -> torch.Tensor:
+    def _compute_performance_weights(
+        self, snap: dict[int, tuple[float, int, int]]
+    ) -> torch.Tensor:
         n = self.metagraph.n
         weights = torch.zeros(n)
-        snap = self.performance_tracker.snapshot()
-        exploration_floor = 1.0 / n
 
         for uid in range(n):
-            rate, count = snap.get(uid, (0.0, 0))
+            rate, cap, count = snap.get(uid, (0.0, 1, 0))
             if count >= PERFORMANCE_MIN_SAMPLES:
-                weights[uid] = rate**PERFORMANCE_CURVE_POWER
-            elif uid < len(scores) and scores[uid] > 0:
-                weights[uid] = exploration_floor
+                throughput = rate * cap
+                weights[uid] = throughput**PERFORMANCE_CURVE_POWER
 
         total = weights.sum()
         if total > 0:
@@ -264,8 +293,7 @@ class WeightsManager:
 
         return weights
 
-    def update_weights(self, scores: torch.Tensor) -> bool:
-        """Updates the weights based on the given scores and sets them on the chain."""
+    def update_weights(self) -> bool:
         should_update, message = self.should_update_weights()
         if not should_update:
             bt.logging.info(message)
@@ -273,21 +301,21 @@ class WeightsManager:
 
         bt.logging.info("Updating weights")
 
-        weights = self._compute_performance_weights(scores)
+        snap = self.performance_tracker.throughput_snapshot(MAX_MINER_CAPACITY)
+        weights = self._compute_performance_weights(snap)
 
-        snap = self.performance_tracker.snapshot()
         tracked = {
-            uid: rate
-            for uid, (rate, count) in snap.items()
+            uid: (rate, cap, rate * cap)
+            for uid, (rate, cap, count) in snap.items()
             if count >= PERFORMANCE_MIN_SAMPLES
         }
         if tracked:
-            top = sorted(tracked.items(), key=lambda x: x[1], reverse=True)[:5]
+            top = sorted(tracked.items(), key=lambda x: x[1][2], reverse=True)[:5]
             adaptive_to = self.performance_tracker.adaptive_timeout()
             bt.logging.info(
-                f"Performance tracker: {len(tracked)} UIDs tracked, "
+                f"Throughput scoring: {len(tracked)} UIDs tracked, "
                 f"adaptive timeout: {adaptive_to:.1f}s, "
-                f"top 5: {[(uid, f'{rate:.2%}') for uid, rate in top]}"
+                f"top 5: {[(uid, f'rate={r:.2f} cap={c} tput={t:.2f}') for uid, (r, c, t) in top]}"
             )
 
         owner_hotkey = self.subtensor.get_subnet_owner_hotkey(self.metagraph.netuid)
