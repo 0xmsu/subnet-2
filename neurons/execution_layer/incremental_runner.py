@@ -635,7 +635,10 @@ class IncrementalRunner:
         slice_dir = state.slices_path / slice_id
         dslice_path = state.slices_path / f"{slice_id}.dslice"
 
-        if not slice_dir.exists() and dslice_path.exists():
+        if not dslice_path.exists():
+            return
+
+        if not slice_dir.exists() or not (slice_dir / "payload").exists():
             logging.info(f"Extracting {slice_id} from {dslice_path}")
             Converter.extract_single_slice(
                 state.slices_path, slice_id, state.slices_path
