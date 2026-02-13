@@ -130,9 +130,9 @@ class ValidatorLoop:
 
         self._should_run = True
 
-        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=32)
         self.response_thread_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=16
+            max_workers=32
         )
         self.recent_responses: list[MinerResponse] = []
 
@@ -335,7 +335,7 @@ class ValidatorLoop:
                     key=lambda x: x[1],
                     reverse=True,
                 )
-                top_count = max(1, len(ranked) // 5)
+                top_count = max(1, len(ranked) // 20)
                 api_eligible_uids = (
                     {uid for uid, _ in ranked[:top_count]} if ranked else set()
                 )
