@@ -616,6 +616,10 @@ class RelayManager:
             protobuf_array = None
             if protobuf_b64:
                 raw_bytes = base64.b64decode(protobuf_b64)
+                if raw_bytes[:2] == b"\x1f\x8b":
+                    import gzip
+
+                    raw_bytes = gzip.decompress(raw_bytes)
                 protobuf_array = await loop.run_in_executor(
                     self._relay_executor, _decode_protobuf_input, raw_bytes
                 )
