@@ -30,7 +30,11 @@ async def query_miner(
     response = await httpx_client.post(
         url=url,
         content=content,
-        timeout=request.circuit.timeout if request.circuit else None,
+        timeout=(
+            request.timeout_override
+            if request.timeout_override is not None
+            else (request.circuit.timeout if request.circuit else None)
+        ),
         headers=headers,
     )
     response.raise_for_status()

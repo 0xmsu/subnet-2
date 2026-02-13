@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
 class PerformanceTracker:
     RESPONSE_TIME_PERCENTILE = 0.95
+    ADAPTIVE_TIMEOUT_MULTIPLIER = 2.0
+    ADAPTIVE_TIMEOUT_MIN_SAMPLES = 50
 
     def __init__(
         self,
@@ -40,17 +42,23 @@ class PerformanceTracker:
         self.persistence_path = persistence_path
         self._load()
 
-    def _reference_time(self) -> float:
+    def _success_times(self) -> list[float]:
         times = []
         for w in self.windows.values():
             for success, rt in w:
                 if success and rt > 0:
                     times.append(rt)
+        return times
+
+    def _percentile_time(self, times: list[float]) -> float:
         if not times:
             return CIRCUIT_TIMEOUT_SECONDS
         times.sort()
         idx = min(int(len(times) * self.RESPONSE_TIME_PERCENTILE), len(times) - 1)
-        return max(times[idx], 1.0)
+        return times[idx]
+
+    def _reference_time(self) -> float:
+        return max(self._percentile_time(self._success_times()), 1.0)
 
     def _score(self, success: bool, response_time_sec: float, ref: float) -> float:
         if not success:
@@ -101,12 +109,42 @@ class PerformanceTracker:
                 return 0
             return len(self.windows[uid])
 
+    def adaptive_timeout(self) -> float:
+        with self._lock:
+            times = self._success_times()
+            if len(times) < self.ADAPTIVE_TIMEOUT_MIN_SAMPLES:
+                return CIRCUIT_TIMEOUT_SECONDS
+            return min(
+                self._percentile_time(times) * self.ADAPTIVE_TIMEOUT_MULTIPLIER,
+                CIRCUIT_TIMEOUT_SECONDS,
+            )
+
     def snapshot(self) -> dict[int, tuple[float, int]]:
         with self._lock:
             ref = self._reference_time()
             return {
                 uid: (self._uid_rate(w, ref), len(w)) for uid, w in self.windows.items()
             }
+
+    def miner_capacities(self, max_capacity: int) -> dict[int, int]:
+        with self._lock:
+            ref = self._reference_time()
+            capacities = {}
+            for uid, w in self.windows.items():
+                count = len(w)
+                if count < PERFORMANCE_MIN_SAMPLES:
+                    capacities[uid] = 1
+                    continue
+                rate = self._uid_rate(w, ref)
+                confidence = min(count / 50.0, 1.0)
+                raw = 1 + (max_capacity - 1) * rate * confidence
+                capacities[uid] = max(1, int(raw))
+            return capacities
+
+    def reset_uid(self, uid: int) -> None:
+        with self._lock:
+            if uid in self.windows:
+                del self.windows[uid]
 
     def save(self) -> None:
         if not self.persistence_path:
@@ -245,8 +283,10 @@ class WeightsManager:
         }
         if tracked:
             top = sorted(tracked.items(), key=lambda x: x[1], reverse=True)[:5]
+            adaptive_to = self.performance_tracker.adaptive_timeout()
             bt.logging.info(
                 f"Performance tracker: {len(tracked)} UIDs tracked, "
+                f"adaptive timeout: {adaptive_to:.1f}s, "
                 f"top 5: {[(uid, f'{rate:.2%}') for uid, rate in top]}"
             )
 
