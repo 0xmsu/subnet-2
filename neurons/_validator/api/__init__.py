@@ -160,9 +160,18 @@ def _relay_ws_process(
     inbox: mp.Queue,
     outbox: mp.Queue,
 ):
+    import logging
     import signal
+    import sys
 
     import bittensor as bt
+
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO,
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
+    log = logging.getLogger("relay_ws")
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     wallet = bt.Wallet(name=wallet_name, hotkey=wallet_hotkey)
@@ -201,7 +210,7 @@ def _relay_ws_process(
                     if json.loads(raw_result).get("type") != "auth_success":
                         continue
 
-                    bt.logging.success("Relay WS process: connected and authenticated")
+                    log.info("Relay WS process: connected and authenticated")
                     reconnect_delay = RELAY_RECONNECT_BASE_DELAY
 
                     async def _reader():
@@ -234,9 +243,9 @@ def _relay_ws_process(
                     await asyncio.gather(*pending, return_exceptions=True)
 
             except Exception as e:
-                bt.logging.warning(f"Relay WS process error: {e}")
+                log.warning(f"Relay WS process error: {e}")
 
-            bt.logging.info(f"Relay WS process: reconnecting in {reconnect_delay}s")
+            log.info(f"Relay WS process: reconnecting in {reconnect_delay}s")
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, RELAY_RECONNECT_MAX_DELAY)
 
