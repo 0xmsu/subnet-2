@@ -457,7 +457,14 @@ class IncrementalRunner:
             self._store_slice_output(state, meta, output)
 
         if not state.pending_work:
-            if state.failed_tasks:
+            is_api_sampled = (
+                state.run_source == RunSource.API
+                and meta
+                and meta.tiling
+                and meta.tiling.num_tiles > self.API_SAMPLE_TILES
+            )
+
+            if state.failed_tasks and not is_api_sampled:
                 logging.error(
                     f"Slice {slice_id} has {len(state.failed_tasks)} failed tasks, aborting run"
                 )
@@ -466,9 +473,17 @@ class IncrementalRunner:
                 self._on_complete(state)
                 return True
 
+            if state.failed_tasks and is_api_sampled:
+                logging.warning(
+                    f"Slice {slice_id} has {len(state.failed_tasks)} failed tasks "
+                    f"(API sampled run, continuing)"
+                )
+
             try:
-                if meta and meta.tiling and meta.tiling.num_tiles > 1:
-                    self._reconstruct_from_tiles(state, slice_id, meta.tiling)
+                if not is_api_sampled:
+                    if meta and meta.tiling and meta.tiling.num_tiles > 1:
+                        self._reconstruct_from_tiles(state, slice_id, meta.tiling)
+                if meta and meta.tiling:
                     self._cleanup_tile_cache(state, meta.tiling)
                 self._cleanup_extracted_slice(state, slice_id)
                 state.completed_slices.append(slice_id)

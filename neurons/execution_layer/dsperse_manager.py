@@ -683,7 +683,7 @@ class DSperseManager:
                 api_url = "https://sn2-api.inferencelabs.com"
 
             hotkey = self._get_validator_hotkey()
-            body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            body = json.dumps(payload)
             signature = self._sign_request(body)
 
             if hotkey == "unknown" or not signature:
@@ -699,8 +699,7 @@ class DSperseManager:
                     content=body,
                     headers={
                         "Content-Type": "application/json",
-                        "X-Signature": signature,
-                        "X-Hotkey": hotkey,
+                        "X-Request-Signature": signature,
                     },
                 )
                 if response.status_code == 200:
@@ -722,12 +721,11 @@ class DSperseManager:
 
     def _sign_request(self, body: str) -> str:
         try:
-            import hashlib
+            import base64
 
             wallet = bt.Wallet(config=cli_parser.config)
-            message = hashlib.sha256(body.encode()).hexdigest()
-            signature = wallet.hotkey.sign(message.encode())
-            return signature.hex()
+            signature = wallet.hotkey.sign(body.encode())
+            return base64.b64encode(signature).decode()
         except Exception:
             return ""
 
