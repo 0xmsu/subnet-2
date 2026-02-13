@@ -704,7 +704,6 @@ class RelayManager:
                 run_status = (
                     "completed" if status.all_successful else "completed_with_errors"
                 )
-                self._cleanup_run(run_uid)
             else:
                 run_status = "processing"
 
