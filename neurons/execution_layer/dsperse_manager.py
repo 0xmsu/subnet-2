@@ -1,5 +1,7 @@
 import asyncio
+import fcntl
 import json
+import os
 import random
 import shutil
 import tempfile
@@ -79,13 +81,28 @@ class DSperseManager:
         dslice_path = base_path / f"{slice_id}.dslice"
         if not dslice_path.exists():
             return False
-        logging.info(f"Extracting {slice_id} from {dslice_path}")
-        try:
-            Converter.extract_single_slice(base_path, slice_id, base_path)
-            return True
-        except Exception as e:
-            logging.error(f"Failed to extract {slice_id} from {dslice_path}: {e}")
-            return False
+        lock_path = base_path / f".{slice_id}.lock"
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if slice_dir.exists():
+                    return True
+                staging_dir = base_path / f".{slice_id}.staging"
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir)
+                logging.info(f"Extracting {slice_id} from {dslice_path}")
+                Converter.extract_single_slice(base_path, slice_id, staging_dir)
+                os.rename(str(staging_dir / slice_id), str(slice_dir))
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                return True
+            except Exception as e:
+                logging.error(f"Failed to extract {slice_id} from {dslice_path}: {e}")
+                staging_dir = base_path / f".{slice_id}.staging"
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                if slice_dir.exists():
+                    shutil.rmtree(slice_dir, ignore_errors=True)
+                return False
 
     @property
     def circuits(self) -> list[Circuit]:
