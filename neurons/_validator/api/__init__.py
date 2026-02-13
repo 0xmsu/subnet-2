@@ -594,6 +594,24 @@ class RelayManager:
 
             bt.logging.info(f"Starting DSperse run for circuit {circuit_id}")
 
+            aborted = await loop.run_in_executor(
+                self._relay_executor,
+                self.dsperse_manager.abort_benchmark_runs,
+            )
+
+            drained = 0
+            while not self.stacked_requests_queue.empty():
+                try:
+                    self.stacked_requests_queue.get_nowait()
+                    drained += 1
+                except asyncio.QueueEmpty:
+                    break
+            if aborted or drained:
+                bt.logging.info(
+                    f"API priority: aborted {len(aborted)} benchmark runs, "
+                    f"drained {drained} queued items"
+                )
+
             run_uid = await loop.run_in_executor(
                 self._relay_executor,
                 lambda: self.dsperse_manager.start_incremental_run(

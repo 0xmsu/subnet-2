@@ -220,7 +220,16 @@ class DSperseManager:
             incremental_runs_snapshot = list(self._incremental_runs)
             active_circuit_ids = set(self._incremental_run_circuits.values())
 
-        for run_uid in incremental_runs_snapshot:
+        api_runs = [
+            uid
+            for uid in incremental_runs_snapshot
+            if self._incremental_runner.get_run_source(uid) == RunSource.API
+        ]
+        other_runs = [
+            uid for uid in incremental_runs_snapshot if uid not in set(api_runs)
+        ]
+
+        for run_uid in api_runs + other_runs:
             if not self._incremental_runner.is_complete(run_uid):
                 requests = self.get_next_incremental_work(run_uid)
                 if requests:
