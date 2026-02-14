@@ -8,6 +8,7 @@ import copy
 import io
 import json
 import multiprocessing as mp
+import multiprocessing.synchronize
 import os
 import queue
 import threading
@@ -159,6 +160,7 @@ def _relay_ws_process(
     wallet_hotkey: str,
     inbox: mp.Queue,
     outbox: mp.Queue,
+    notify_event: mp.synchronize.Event,
 ):
     import logging
     import signal
@@ -221,15 +223,16 @@ def _relay_ws_process(
                         loop = asyncio.get_running_loop()
                         while ws.close_code is None:
                             try:
-                                msg = await asyncio.wait_for(
-                                    loop.run_in_executor(
-                                        None, lambda: outbox.get(timeout=0.5)
-                                    ),
-                                    timeout=2.0,
-                                )
+                                msg = outbox.get_nowait()
                                 await ws.send(msg)
-                            except (asyncio.TimeoutError, queue.Empty):
                                 continue
+                            except queue.Empty:
+                                pass
+                            notified = await loop.run_in_executor(
+                                None, notify_event.wait, 0.5
+                            )
+                            if notified:
+                                notify_event.clear()
 
                     done, pending = await asyncio.wait(
                         {
@@ -260,6 +263,7 @@ class RelayManager:
     def __init__(self, config: ValidatorConfig):
         self.config = config
         self.stacked_requests_queue: asyncio.Queue = asyncio.Queue()
+        self.api_requests_queue: asyncio.Queue = asyncio.Queue()
         self.rwr_queue: asyncio.Queue = asyncio.Queue()
         self.pending_requests: dict[str, asyncio.Event] = {}
         self.request_results: dict[str, dict] = {}
@@ -275,11 +279,14 @@ class RelayManager:
         self._onnx_max_queue = 15
         self._onnx_pending: list[tuple[str, object, dict]] = []
         self._onnx_pending_lock = threading.Lock()
-        self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self._relay_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        self._dsperse_submit_sem: asyncio.Semaphore | None = None
+        self._background_tasks: set[asyncio.Task] = set()
         threading.Thread(target=self._monitor_onnx_results, daemon=True).start()
 
         self._ws_inbox: mp.Queue = _spawn_ctx.Queue()
         self._ws_outbox: mp.Queue = _spawn_ctx.Queue()
+        self._ws_notify_event: mp.synchronize.Event = _spawn_ctx.Event()
         self._ws_process: mp.Process | None = None
         self._should_run = True
         self._task: asyncio.Task | None = None
@@ -341,6 +348,7 @@ class RelayManager:
                 del self._onnx_outputs[k]
 
     def _start_ws_process(self) -> None:
+        self._ws_notify_event.clear()
         self._ws_process = _spawn_ctx.Process(
             target=_relay_ws_process,
             args=(
@@ -349,10 +357,14 @@ class RelayManager:
                 self.config.wallet.hotkey_str,
                 self._ws_inbox,
                 self._ws_outbox,
+                self._ws_notify_event,
             ),
             daemon=True,
         )
         self._ws_process.start()
+
+    def _notify_ws_writer(self) -> None:
+        self._ws_notify_event.set()
 
     def start(self) -> None:
         if not self.config.relay_enabled:
@@ -383,6 +395,8 @@ class RelayManager:
             self._start_ws_process()
 
     async def _dispatch_loop(self) -> None:
+        if self._dsperse_submit_sem is None:
+            self._dsperse_submit_sem = asyncio.Semaphore(64)
         loop = asyncio.get_running_loop()
         health_check_counter = 0
         while self._should_run:
@@ -399,31 +413,45 @@ class RelayManager:
                 continue
 
             bt.logging.debug(f"Received relay message: {str(message)[:100]}...")
-            try:
-                response = await async_dispatch(
-                    message,
-                    methods={
-                        "subnet-2.proof_of_computation": self.handle_proof_of_computation,
-                        "subnet-2.dsperse_submit": self.handle_dsperse_submit,
-                        "subnet-2.run_status": self.handle_run_status,
-                    },
+            task = asyncio.create_task(self._handle_relay_message(message))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def _handle_relay_message(self, message: str) -> None:
+        try:
+            response = await async_dispatch(
+                message,
+                methods={
+                    "subnet-2.proof_of_computation": self.handle_proof_of_computation,
+                    "subnet-2.dsperse_submit": self._guarded_dsperse_submit,
+                    "subnet-2.run_status": self.handle_run_status,
+                },
+            )
+            self._ws_outbox.put(str(response))
+            self._notify_ws_writer()
+        except Exception as e:
+            bt.logging.error(f"Error processing relay message: {e}")
+            traceback.print_exc()
+            request_id = None
+            with contextlib.suppress(Exception):
+                request_id = json.loads(message).get("id")
+            self._ws_outbox.put(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32603, "message": str(e)},
+                        "id": request_id,
+                    }
                 )
-                self._ws_outbox.put(str(response))
-            except Exception as e:
-                bt.logging.error(f"Error processing relay message: {e}")
-                traceback.print_exc()
-                request_id = None
-                with contextlib.suppress(Exception):
-                    request_id = json.loads(message).get("id")
-                self._ws_outbox.put(
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "error": {"code": -32603, "message": str(e)},
-                            "id": request_id,
-                        }
-                    )
-                )
+            )
+            self._notify_ws_writer()
+
+    async def _guarded_dsperse_submit(self, **params: object) -> dict[str, object]:
+        if self._dsperse_submit_sem.locked():
+            bt.logging.warning("DSperse submit queue full (max 64)")
+            return Error(20, "Server busy, try again later")
+        async with self._dsperse_submit_sem:
+            return await self.handle_dsperse_submit(**params)
 
     def on_api_run_complete(
         self,
@@ -454,6 +482,7 @@ class RelayManager:
                 }
             )
         )
+        self._notify_ws_writer()
 
     async def handle_proof_of_computation(self, **params: dict) -> dict:
         input_json = params.get("input")
@@ -599,6 +628,10 @@ class RelayManager:
             protobuf_array = None
             if protobuf_b64:
                 raw_bytes = base64.b64decode(protobuf_b64)
+                if raw_bytes[:2] == b"\x1f\x8b":
+                    import gzip
+
+                    raw_bytes = gzip.decompress(raw_bytes)
                 protobuf_array = await loop.run_in_executor(
                     self._relay_executor, _decode_protobuf_input, raw_bytes
                 )
@@ -632,28 +665,8 @@ class RelayManager:
                 ),
             )
 
-            aborted = await loop.run_in_executor(
-                self._relay_executor,
-                self.dsperse_manager.abort_benchmark_runs,
-            )
-
-            drained = 0
-            while not self.stacked_requests_queue.empty():
-                try:
-                    self.stacked_requests_queue.get_nowait()
-                    drained += 1
-                except asyncio.QueueEmpty:
-                    break
-            if aborted or drained:
-                bt.logging.info(
-                    f"API priority: aborted {len(aborted)} benchmark runs, "
-                    f"drained {drained} queued items"
-                )
-
             if self.dispatch_event:
                 self.dispatch_event.set()
-
-            self._evict_stale_onnx_outputs()
 
             status = self.dsperse_manager._incremental_runner.get_run_status(run_uid)
             return Success(
@@ -704,7 +717,6 @@ class RelayManager:
                 run_status = (
                     "completed" if status.all_successful else "completed_with_errors"
                 )
-                self._cleanup_run(run_uid)
             else:
                 run_status = "processing"
 

@@ -49,8 +49,6 @@ from constants import (
     LOOP_DELAY_SECONDS,
     PERFORMANCE_MIN_SAMPLES,
     RunSource,
-    MAX_CONCURRENT_REQUESTS,
-    MAX_MINER_CAPACITY,
     ONE_HOUR,
     ONE_MINUTE,
     TEN_MINUTES,
@@ -62,6 +60,13 @@ from utils.gc_logging import log_responses as gc_log_responses
 DEBUG_SYNC_MODE = os.environ.get("DEBUG_SYNC_MODE", "").lower() in ("1", "true", "yes")
 
 MAX_SLICE_RETRIES = 5
+MAX_API_RETRIES = 20
+API_TIMEOUT_SECONDS = 30.0
+
+
+def _is_api_request(request: Request) -> bool:
+    q = request.queued_request
+    return q is not None and getattr(q, "run_source", None) == RunSource.API
 
 
 class ValidatorLoop:
@@ -83,7 +88,7 @@ class ValidatorLoop:
         self.auto_update = AutoUpdate()
         self.httpx_client = httpx.AsyncClient()
 
-        self.current_concurrency = MAX_CONCURRENT_REQUESTS
+        self.current_concurrency = config.max_concurrency
 
         api_url = (
             getattr(cli_parser.config, "sn2_api_url", None)
@@ -120,6 +125,8 @@ class ValidatorLoop:
 
         self.request_queue = asyncio.Queue()
         self.active_tasks: dict[str, asyncio.Task | None] = {}
+        self.benchmark_in_flight = 0
+        self._api_task_ids: set[str] = set()
         self.miner_active_count: dict[int, int] = {}
         self.miner_capacities: dict[int, int] = {}
         self._uid_hotkeys: dict[int, str] = {}
@@ -130,9 +137,9 @@ class ValidatorLoop:
 
         self._should_run = True
 
-        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=32)
         self.response_thread_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=16
+            max_workers=32
         )
         self.recent_responses: list[MinerResponse] = []
 
@@ -152,9 +159,8 @@ class ValidatorLoop:
                 asyncio.get_event_loop().run_in_executor(
                     self.thread_pool,
                     self.weights_manager.update_weights,
-                    self.score_manager.scores,
                 ),
-                timeout=120.0,  # 2 minute timeout
+                timeout=120.0,
             )
             duration = time.time() - start_time
             log_weight_update(duration, success=True)
@@ -224,14 +230,14 @@ class ValidatorLoop:
     @with_rate_limit(period=ONE_MINUTE / 4)
     def log_health(self):
         bt.logging.info(
-            f"In-flight requests: {len(self.active_tasks)} / {MAX_CONCURRENT_REQUESTS}"
+            f"In-flight requests: {len(self.active_tasks)} / {self.current_concurrency}"
         )
         bt.logging.debug(f"Queryable UIDs: {len(self.queryable_uids)}")
 
         log_system_metrics()
         queue_size = self.request_queue.qsize()
         est_latency = (
-            queue_size * (LOOP_DELAY_SECONDS / MAX_CONCURRENT_REQUESTS)
+            queue_size * (LOOP_DELAY_SECONDS / self.current_concurrency)
             if queue_size > 0
             else 0
         )
@@ -271,6 +277,12 @@ class ValidatorLoop:
             self.last_response_time = time.time()
             self.recent_responses = []
 
+    def _enqueue_dslice(self, req) -> None:
+        if getattr(req, "run_source", None) == RunSource.API:
+            self.relay.api_requests_queue.put_nowait(req)
+        else:
+            self.relay.stacked_requests_queue.put_nowait(req)
+
     async def maintain_request_pool(self):
         """
         Maintain the pool of active requests to miners.
@@ -288,7 +300,10 @@ class ValidatorLoop:
                         continue
                     continue
 
-                if self.relay.stacked_requests_queue.empty():
+                if (
+                    self.relay.stacked_requests_queue.empty()
+                    or self.relay.api_requests_queue.empty()
+                ):
                     new_requests = list(
                         await asyncio.to_thread(
                             self.dsperse_manager.generate_dslice_requests
@@ -299,11 +314,12 @@ class ValidatorLoop:
                             f"Generated {len(new_requests)} new requests, inserting into queue"
                         )
                     for dslice_request in new_requests:
-                        self.relay.stacked_requests_queue.put_nowait(dslice_request)
+                        self._enqueue_dslice(dslice_request)
 
                 pow_circuit = None
                 if (
-                    len(self.score_manager.pow_manager.proof_of_weights_queue)
+                    not self.config.disable_benchmark
+                    and len(self.score_manager.pow_manager.proof_of_weights_queue)
                     >= ProofOfWeightsHandler.BATCH_SIZE
                 ):
                     loop = asyncio.get_event_loop()
@@ -320,9 +336,7 @@ class ValidatorLoop:
                     self.weights_manager.performance_tracker.adaptive_timeout()
                 )
                 self.miner_capacities = (
-                    self.weights_manager.performance_tracker.miner_capacities(
-                        MAX_MINER_CAPACITY
-                    )
+                    self.weights_manager.performance_tracker.miner_capacities()
                 )
 
                 snap = self.weights_manager.performance_tracker.snapshot()
@@ -336,7 +350,7 @@ class ValidatorLoop:
                     key=lambda x: x[1],
                     reverse=True,
                 )
-                top_count = max(1, len(ranked) // 5)
+                top_count = max(1, len(ranked) * self.config.api_miners_pct // 100)
                 api_eligible_uids = (
                     {uid for uid, _ in ranked[:top_count]} if ranked else set()
                 )
@@ -366,30 +380,44 @@ class ValidatorLoop:
                             request = self.request_pipeline._prepare_queued_request(
                                 uid, rwr_req
                             )
-                        elif not self.relay.stacked_requests_queue.empty():
-                            next_req = self.relay.stacked_requests_queue.get_nowait()
-                            if (
-                                api_eligible_uids
-                                and hasattr(next_req, "run_source")
-                                and next_req.run_source == RunSource.API
-                                and uid not in api_eligible_uids
-                            ):
-                                self.relay.stacked_requests_queue.put_nowait(next_req)
+                            if not request:
+                                self.relay.rwr_queue.put_nowait(rwr_req)
                                 break
+                        elif (
+                            uid in api_eligible_uids
+                            and not self.relay.api_requests_queue.empty()
+                        ):
+                            next_req = self.relay.api_requests_queue.get_nowait()
                             request = self.request_pipeline._prepare_queued_request(
                                 uid, next_req
                             )
+                            if not request:
+                                self.relay.api_requests_queue.put_nowait(next_req)
+                                continue
+                        elif not self.relay.stacked_requests_queue.empty() and (
+                            not self.config.max_benchmark_concurrent
+                            or self.benchmark_in_flight
+                            < self.config.max_benchmark_concurrent
+                        ):
+                            next_req = self.relay.stacked_requests_queue.get_nowait()
+                            request = self.request_pipeline._prepare_queued_request(
+                                uid, next_req
+                            )
+                            if not request:
+                                self.relay.stacked_requests_queue.put_nowait(next_req)
+                                break
                         else:
                             break
 
-                        if not request:
-                            bt.logging.warning(
-                                f"Empty request prepared for UID {uid}, skipping"
-                            )
-                            break
-
-                        request.timeout_override = adaptive_to
+                        is_api = _is_api_request(request)
+                        request.timeout_override = (
+                            API_TIMEOUT_SECONDS if is_api else adaptive_to
+                        )
                         task_id = self._generate_task_id(uid)
+                        if is_api:
+                            self._api_task_ids.add(task_id)
+                        else:
+                            self.benchmark_in_flight += 1
 
                         if DEBUG_SYNC_MODE:
                             bt.logging.debug(
@@ -438,6 +466,11 @@ class ValidatorLoop:
     def _handle_completed_task(self, task_id: str, uid: int):
         if task_id in self.active_tasks:
             del self.active_tasks[task_id]
+
+        if task_id in self._api_task_ids:
+            self._api_task_ids.discard(task_id)
+        else:
+            self.benchmark_in_flight = max(0, self.benchmark_in_flight - 1)
 
         if uid in self.miner_active_count:
             self.miner_active_count[uid] = max(0, self.miner_active_count[uid] - 1)
@@ -511,7 +544,7 @@ class ValidatorLoop:
                     except Exception:
                         pass  # Thread pool internals may not be accessible
                     bt.logging.warning(
-                        f"Active tasks: {len(self.active_tasks)}/{MAX_CONCURRENT_REQUESTS}, "
+                        f"Active tasks: {len(self.active_tasks)}/{self.current_concurrency}, "
                         f"Queue size: {self.request_queue.qsize()}, "
                         f"Queryable UIDs: {len(self.queryable_uids)}, "
                         f"Current concurrency: {self.current_concurrency}"
@@ -539,7 +572,9 @@ class ValidatorLoop:
         Run the main validator loop indefinitely.
         """
         bt.logging.success(
-            f"Validator started on subnet {self.config.subnet_uid} using UID {self.config.user_uid}"
+            f"Validator started on subnet {self.config.subnet_uid} using UID {self.config.user_uid} "
+            f"(concurrency={self.current_concurrency}, api_miners_pct={self.config.api_miners_pct}%, "
+            f"benchmark={'off' if self.config.disable_benchmark else 'on'})"
         )
 
         self.relay.start()
@@ -615,12 +650,18 @@ class ValidatorLoop:
             if response:
                 await self._handle_response(response)
             elif not rescheduled:
-                self.weights_manager.performance_tracker.record(request.uid, False)
+                was_at_cap = self.miner_active_count.get(
+                    request.uid, 0
+                ) >= self.miner_capacities.get(request.uid, 1)
+                self.weights_manager.performance_tracker.record(
+                    request.uid, False, was_at_capacity=was_at_cap
+                )
 
     def _reschedule_request(self, request: Request) -> None:
         """
         Reschedule a failed request for retry.
-        Only RWR and DSLICE requests are rescheduled, up to MAX_SLICE_RETRIES times.
+        RWR and DSLICE requests are rescheduled up to MAX_API_RETRIES (API) or
+        MAX_SLICE_RETRIES (non-API) times.
         """
         self.weights_manager.performance_tracker.record_reschedule(request.uid)
 
@@ -639,10 +680,12 @@ class ValidatorLoop:
         queued = request.queued_request
         queued.retry_count += 1
 
-        if queued.retry_count > MAX_SLICE_RETRIES:
+        max_retries = MAX_API_RETRIES if _is_api_request(request) else MAX_SLICE_RETRIES
+
+        if queued.retry_count > max_retries:
             bt.logging.warning(
                 f"{request.request_type.name} request exceeded max retries "
-                f"({MAX_SLICE_RETRIES}) for UID {request.uid}"
+                f"({max_retries}) for UID {request.uid}"
             )
             self.request_pipeline.hash_guard.remove_hash(request.guard_hash)
             if request.request_type == RequestType.DSLICE:
@@ -656,14 +699,14 @@ class ValidatorLoop:
 
         bt.logging.info(
             f"Rescheduling {request.request_type.name} request for UID {request.uid} "
-            f"(attempt {queued.retry_count}/{MAX_SLICE_RETRIES})..."
+            f"(attempt {queued.retry_count}/{max_retries})..."
         )
 
         self.request_pipeline.hash_guard.remove_hash(request.guard_hash)
         if request.request_type == RequestType.RWR:
             self.relay.rwr_queue.put_nowait(queued)
         else:
-            self.relay.stacked_requests_queue.put_nowait(queued)
+            self._enqueue_dslice(queued)
 
     def _mark_dslice_failed(self, queued: DSliceQueuedProofRequest) -> None:
         if getattr(queued, "is_tile", False):
@@ -721,15 +764,8 @@ class ValidatorLoop:
                 )
             )
             if next_requests and not is_complete:
-                queue = self.relay.stacked_requests_queue
-                bt.logging.info(
-                    f"Inserting {len(next_requests)} items into queue (size: {queue.qsize()})"
-                )
                 for req in next_requests:
-                    queue.put_nowait(req)
-                bt.logging.info(
-                    f"Queued {len(next_requests)} items for {run_uid} (size now: {queue.qsize()})"
-                )
+                    self._enqueue_dslice(req)
         else:
             is_complete, next_request = (
                 self.dsperse_manager.on_incremental_slice_result(
@@ -744,7 +780,7 @@ class ValidatorLoop:
                 )
             )
             if next_request and not is_complete:
-                self.relay.stacked_requests_queue.put_nowait(next_request)
+                self._enqueue_dslice(next_request)
                 bt.logging.debug(f"Queued next incremental slice for run {run_uid}")
 
     async def _handle_response(self, response: MinerResponse) -> None:
@@ -755,10 +791,14 @@ class ValidatorLoop:
             response (MinerResponse): The processed response to handle.
         """
         try:
+            was_at_cap = self.miner_active_count.get(
+                response.uid, 0
+            ) >= self.miner_capacities.get(response.uid, 1)
             self.weights_manager.performance_tracker.record(
                 response.uid,
                 bool(response.verification_result),
                 response_time_sec=response.response_time,
+                was_at_capacity=was_at_cap,
             )
 
             request_hash = response.external_request_hash
