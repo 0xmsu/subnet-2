@@ -54,7 +54,11 @@ from constants import (
     TEN_MINUTES,
 )
 from utils import AutoUpdate, clean_temp_files, with_rate_limit
-from utils.gc_logging import log_responses as gc_log_responses
+from utils.gc_logging import (
+    log_responses as gc_log_responses,
+    HealthMetricsBuffer,
+    gc_log_health,
+)
 
 # Set to True for synchronous request processing (easier debugging)
 DEBUG_SYNC_MODE = os.environ.get("DEBUG_SYNC_MODE", "").lower() in ("1", "true", "yes")
@@ -142,6 +146,7 @@ class ValidatorLoop:
             max_workers=32
         )
         self.recent_responses: list[MinerResponse] = []
+        self._health_buffer = HealthMetricsBuffer()
 
         if self.config.bt_config.prometheus_monitoring:
             start_prometheus_logging(self.config.bt_config.prometheus_port)
@@ -229,8 +234,24 @@ class ValidatorLoop:
 
     @with_rate_limit(period=ONE_MINUTE / 4)
     def log_health(self):
+        import psutil
+
+        try:
+            rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+            timing_entries = sum(
+                len(t.slices) for t in list(self.dsperse_manager._run_timings.values())
+            )
+            tc_keys = 0
+            for state in list(self.dsperse_manager._incremental_runner._runs.values()):
+                tc_keys += len(state.tensor_cache)
+        except Exception as e:
+            bt.logging.warning(f"Health diagnostics error: {e}")
+            return
         bt.logging.info(
-            f"In-flight requests: {len(self.active_tasks)} / {self.current_concurrency}"
+            f"In-flight requests: {len(self.active_tasks)} / {self.current_concurrency} | "
+            f"RSS: {rss_mb:.0f}MB | "
+            f"tensor_cache_keys: {tc_keys} | "
+            f"timing_entries: {timing_entries}"
         )
         bt.logging.debug(f"Queryable UIDs: {len(self.queryable_uids)}")
 
@@ -242,6 +263,33 @@ class ValidatorLoop:
             else 0
         )
         log_queue_metrics(queue_size, est_latency)
+
+        if not cli_parser.config.disable_metric_logging:
+            snapshot = {
+                "rss_mb": rss_mb,
+                "tensor_cache_keys": tc_keys,
+                "timing_entries": timing_entries,
+                "active_tasks": len(self.active_tasks),
+                "current_concurrency": self.current_concurrency,
+                "queue_size": queue_size,
+            }
+            aggregated = self._health_buffer.push(snapshot)
+            if aggregated is not None:
+                fut = asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    lambda: gc_log_health(
+                        self.config.wallet.hotkey,
+                        self.config.user_uid,
+                        aggregated,
+                    ),
+                )
+                fut.add_done_callback(
+                    lambda f: (
+                        bt.logging.error(f"gc_log_health failed: {f.exception()}")
+                        if f.exception()
+                        else None
+                    )
+                )
 
     @with_rate_limit(period=ONE_MINUTE)
     async def log_responses(self):
