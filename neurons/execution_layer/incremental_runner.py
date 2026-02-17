@@ -114,6 +114,7 @@ class RunState:
     run_source: RunSource = RunSource.BENCHMARK
     start_time: float = 0.0
     aborted: bool = False
+    tensor_last_needed_at: dict[str, int] = field(default_factory=dict)
 
     @property
     def current_slice_id(self) -> Optional[str]:
@@ -309,6 +310,19 @@ class IncrementalRunner:
         state.total_tiles = total_tiles
         state.slice_tile_counts = slice_tile_counts
 
+        last_needed: dict[str, int] = {}
+        for idx, sid in enumerate(execution_order):
+            meta = state.slice_metadata.get(sid)
+            if meta:
+                for name in meta.dependencies.filtered_inputs:
+                    last_needed[name] = idx
+        if execution_order:
+            last_meta = state.slice_metadata.get(execution_order[-1])
+            if last_meta:
+                for name in last_meta.dependencies.output:
+                    last_needed[name] = len(execution_order)
+        state.tensor_last_needed_at = last_needed
+
         self._runs[run_uid] = state
         logging.info(
             f"Run {run_uid} initialized with {len(execution_order)} slices, {total_tiles} tiles"
@@ -367,9 +381,7 @@ class IncrementalRunner:
 
         if not has_circuits:
             self._run_onnx_locally(state, slice_id, meta)
-            self._cleanup_extracted_slice(state, slice_id)
-            state.completed_slices.append(slice_id)
-            state.current_idx += 1
+            self._advance_slice(state, slice_id)
             return []
 
         if state.run_source != RunSource.API:
@@ -387,9 +399,7 @@ class IncrementalRunner:
                     f"(max |val|={overflow_info['max_abs']:.0f}, limit={self.JSTPROVE_RANGE_LIMIT}), "
                     f"falling back to ONNX"
                 )
-                self._cleanup_extracted_slice(state, slice_id)
-                state.completed_slices.append(slice_id)
-                state.current_idx += 1
+                self._advance_slice(state, slice_id)
                 if self._on_jstprove_range_fallback:
                     self._on_jstprove_range_fallback(
                         state.run_uid, slice_id, overflow_info
@@ -485,9 +495,7 @@ class IncrementalRunner:
                         self._reconstruct_from_tiles(state, slice_id, meta.tiling)
                 if meta and meta.tiling:
                     self._cleanup_tile_cache(state, meta.tiling)
-                self._cleanup_extracted_slice(state, slice_id)
-                state.completed_slices.append(slice_id)
-                state.current_idx += 1
+                self._advance_slice(state, slice_id)
                 state.failed_tasks.clear()
 
                 if is_api_sampled:
@@ -1065,6 +1073,38 @@ class IncrementalRunner:
         if removed:
             logging.info(
                 f"Cleaned {removed} tile cache entries for slice_idx={slice_idx}"
+            )
+
+    def _advance_slice(self, state: RunState, slice_id: str) -> None:
+        self._cleanup_extracted_slice(state, slice_id)
+        state.completed_slices.append(slice_id)
+        state.current_idx += 1
+        self._evict_unused_tensors(state)
+
+    def _evict_unused_tensors(self, state: RunState) -> None:
+        """Evict tensor_cache entries no longer referenced by any remaining slice.
+
+        Uses state.tensor_last_needed_at (precomputed at run start from
+        slice_metadata) which maps each tensor name to the last slice index
+        that references it. The last slice's outputs are mapped to
+        len(execution_order) so they survive for get_final_output. Keys
+        starting with "tile_" are skipped — those are managed by
+        _cleanup_tile_cache. Builds a snapshot list before mutating
+        state.tensor_cache.
+        """
+        idx = state.current_idx
+        last_needed = state.tensor_last_needed_at
+        evictable = [
+            k
+            for k in state.tensor_cache
+            if not k.startswith("tile_") and last_needed.get(k, -1) < idx
+        ]
+        for k in evictable:
+            del state.tensor_cache[k]
+        if evictable:
+            logging.info(
+                f"Run {state.run_uid}: evicted {len(evictable)} unused tensors "
+                f"from cache ({len(state.tensor_cache)} remaining)"
             )
 
     def _on_complete(self, state: RunState) -> None:
