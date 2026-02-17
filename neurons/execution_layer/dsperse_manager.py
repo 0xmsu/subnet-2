@@ -57,6 +57,10 @@ _extraction_locks_guard = threading.Lock()
 
 
 class DSperseManager:
+    @staticmethod
+    def _normalize_slice_id(slice_num: str) -> str:
+        return slice_num if slice_num.startswith("slice_") else f"slice_{slice_num}"
+
     def __init__(
         self,
         event_client: "DsperseEventClient | None" = None,
@@ -68,6 +72,8 @@ class DSperseManager:
             on_jstprove_range_fallback=self._on_jstprove_range_fallback,
             on_tile_onnx_fallback=self._on_tile_onnx_fallback,
             on_preflight_complete=self._on_preflight_complete,
+            on_onnx_slice_completed=self._on_onnx_slice_completed,
+            on_work_items_created=self._on_work_items_created,
         )
         self._incremental_runs: set[str] = set()
         self._incremental_run_circuits: dict[str, str] = {}
@@ -336,9 +342,7 @@ class DSperseManager:
         Returns:
             Tuple of (is_run_complete, next_slice_request)
         """
-        task_id = (
-            f"slice_{slice_num}" if not slice_num.startswith("slice_") else slice_num
-        )
+        task_id = self._normalize_slice_id(slice_num)
 
         is_api = self._incremental_runner.get_run_source(run_uid) == RunSource.API
         with self._run_timings_lock:
@@ -390,7 +394,28 @@ class DSperseManager:
         if not slice_complete:
             return False, None
 
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_slice_transition_started(
+                    run_uid=run_uid,
+                    slice_num=task_id,
+                )
+            )
+
+        transition_start = time.perf_counter()
         next_requests = self.get_next_incremental_work(run_uid)
+        transition_elapsed = time.perf_counter() - transition_start
+
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_slice_transition_complete(
+                    run_uid=run_uid,
+                    slice_num=task_id,
+                    total_tiles=len(next_requests),
+                    response_time_sec=transition_elapsed,
+                )
+            )
+
         return False, next_requests[0] if next_requests else None
 
     def on_incremental_tile_result(
@@ -478,7 +503,29 @@ class DSperseManager:
         if not slice_complete:
             return False, []
 
-        return False, self.get_next_incremental_work(run_uid)
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_slice_transition_started(
+                    run_uid=run_uid,
+                    slice_num=slice_id,
+                )
+            )
+
+        transition_start = time.perf_counter()
+        next_requests = self.get_next_incremental_work(run_uid)
+        transition_elapsed = time.perf_counter() - transition_start
+
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_slice_transition_complete(
+                    run_uid=run_uid,
+                    slice_num=slice_id,
+                    total_tiles=len(next_requests),
+                    response_time_sec=transition_elapsed,
+                )
+            )
+
+        return False, next_requests
 
     async def apply_slice_result(
         self,
@@ -492,6 +539,7 @@ class DSperseManager:
         verification_time_sec: float = 0.0,
     ) -> tuple[bool, list[DSliceQueuedProofRequest]]:
         loop = asyncio.get_running_loop()
+        executor_start = time.perf_counter()
         is_complete, next_req = await loop.run_in_executor(
             self._runner_executor,
             lambda: self.on_incremental_slice_result(
@@ -505,6 +553,15 @@ class DSperseManager:
                 verification_time_sec=verification_time_sec,
             ),
         )
+        executor_elapsed = time.perf_counter() - executor_start
+        if self.event_client and executor_elapsed > 1.0:
+            self._schedule_async(
+                self.event_client.emit_runner_executor_duration(
+                    run_uid=run_uid,
+                    slice_num=self._normalize_slice_id(slice_num),
+                    response_time_sec=executor_elapsed,
+                )
+            )
         return is_complete, [next_req] if next_req else []
 
     async def apply_tile_result(
@@ -522,7 +579,8 @@ class DSperseManager:
         verification_time_sec: float = 0.0,
     ) -> tuple[bool, list[DSliceQueuedProofRequest]]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        executor_start = time.perf_counter()
+        result = await loop.run_in_executor(
             self._runner_executor,
             lambda: self.on_incremental_tile_result(
                 run_uid=run_uid,
@@ -538,6 +596,16 @@ class DSperseManager:
                 verification_time_sec=verification_time_sec,
             ),
         )
+        executor_elapsed = time.perf_counter() - executor_start
+        if self.event_client and executor_elapsed > 1.0:
+            self._schedule_async(
+                self.event_client.emit_runner_executor_duration(
+                    run_uid=run_uid,
+                    slice_num=self._normalize_slice_id(slice_id),
+                    response_time_sec=executor_elapsed,
+                )
+            )
+        return result
 
     def mark_slice_failed(self, run_uid: str, slice_num: str) -> None:
         try:
@@ -675,6 +743,43 @@ class DSperseManager:
                     run_uid=run_uid,
                     slice_num=slice_num,
                     task_id=task_id,
+                )
+            )
+
+    def _on_onnx_slice_completed(
+        self,
+        run_uid: str,
+        slice_id: str,
+        elapsed_sec: float,
+        tensor_cache_entries: int,
+    ) -> None:
+        logging.info(
+            f"ONNX slice {slice_id} completed for run {run_uid}: "
+            f"{elapsed_sec:.3f}s, cache_entries={tensor_cache_entries}"
+        )
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_onnx_slice_completed(
+                    run_uid=run_uid,
+                    slice_num=slice_id,
+                    response_time_sec=elapsed_sec,
+                    tensor_cache_entries=tensor_cache_entries,
+                )
+            )
+
+    def _on_work_items_created(
+        self, run_uid: str, slice_id: str, count: int, elapsed_sec: float
+    ) -> None:
+        logging.info(
+            f"Created {count} work items for run {run_uid} {slice_id} in {elapsed_sec:.3f}s"
+        )
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_work_items_created(
+                    run_uid=run_uid,
+                    slice_num=slice_id,
+                    total_tiles=count,
+                    response_time_sec=elapsed_sec,
                 )
             )
 
