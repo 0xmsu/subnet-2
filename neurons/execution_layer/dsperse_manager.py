@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import os
 import random
@@ -66,16 +67,22 @@ class DSperseManager:
             on_run_complete=self._on_incremental_run_complete,
             on_jstprove_range_fallback=self._on_jstprove_range_fallback,
             on_tile_onnx_fallback=self._on_tile_onnx_fallback,
+            on_preflight_complete=self._on_preflight_complete,
         )
         self._incremental_runs: set[str] = set()
         self._incremental_run_circuits: dict[str, str] = {}
         self._incremental_runs_lock = threading.Lock()
         self._completed_run_statuses: dict[str, tuple[float, RunStatus]] = {}
         self._run_timings: dict[str, _RunTiming] = {}
+        self._run_timings_lock = threading.Lock()
         self._api_round_robin_idx = 0
         self.on_api_run_complete: (
             Callable[[str, str, bool, list[dict]], None] | None
         ) = None
+        self._runner_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="runner"
+        )
+        self.enqueue_fn: Callable[[DSliceQueuedProofRequest], None] | None = None
         self._purge_old_runs()
 
     @staticmethod
@@ -333,21 +340,22 @@ class DSperseManager:
             f"slice_{slice_num}" if not slice_num.startswith("slice_") else slice_num
         )
 
-        timing = self._run_timings.setdefault(run_uid, _RunTiming())
-        timing.total_response_time_sec += response_time_sec
-        timing.total_verification_time_sec += verification_time_sec
         is_api = self._incremental_runner.get_run_source(run_uid) == RunSource.API
-        timing.slices.append(
-            _SliceMetric(
-                slice_num=slice_num,
-                response_time_sec=response_time_sec,
-                verification_time_sec=verification_time_sec,
-                success=success,
-                is_tile=False,
-                proof_data=proof if success and is_api else None,
-                proof_system=proof_system,
+        with self._run_timings_lock:
+            timing = self._run_timings.setdefault(run_uid, _RunTiming())
+            timing.total_response_time_sec += response_time_sec
+            timing.total_verification_time_sec += verification_time_sec
+            timing.slices.append(
+                _SliceMetric(
+                    slice_num=slice_num,
+                    response_time_sec=response_time_sec,
+                    verification_time_sec=verification_time_sec,
+                    success=success,
+                    is_tile=False,
+                    proof_data=proof if success and is_api else None,
+                    proof_system=proof_system,
+                )
             )
-        )
 
         slice_complete = self._incremental_runner.apply_result(
             run_uid=run_uid,
@@ -419,21 +427,22 @@ class DSperseManager:
             Tuple of (is_run_complete, next_requests)
         """
         tile_slice_num = f"{slice_id.removeprefix('slice_')}_tile_{tile_idx}"
-        timing = self._run_timings.setdefault(run_uid, _RunTiming())
-        timing.total_response_time_sec += response_time_sec
-        timing.total_verification_time_sec += verification_time_sec
         is_api = self._incremental_runner.get_run_source(run_uid) == RunSource.API
-        timing.slices.append(
-            _SliceMetric(
-                slice_num=tile_slice_num,
-                response_time_sec=response_time_sec,
-                verification_time_sec=verification_time_sec,
-                success=success,
-                is_tile=True,
-                proof_data=proof if success and is_api else None,
-                proof_system=proof_system,
+        with self._run_timings_lock:
+            timing = self._run_timings.setdefault(run_uid, _RunTiming())
+            timing.total_response_time_sec += response_time_sec
+            timing.total_verification_time_sec += verification_time_sec
+            timing.slices.append(
+                _SliceMetric(
+                    slice_num=tile_slice_num,
+                    response_time_sec=response_time_sec,
+                    verification_time_sec=verification_time_sec,
+                    success=success,
+                    is_tile=True,
+                    proof_data=proof if success and is_api else None,
+                    proof_system=proof_system,
+                )
             )
-        )
 
         slice_complete = self._incremental_runner.apply_result(
             run_uid=run_uid,
@@ -471,6 +480,135 @@ class DSperseManager:
 
         return False, self.get_next_incremental_work(run_uid)
 
+    async def apply_slice_result(
+        self,
+        run_uid: str,
+        slice_num: str,
+        success: bool,
+        computed_outputs: dict | None = None,
+        proof: str | None = None,
+        proof_system: ProofSystem | None = None,
+        response_time_sec: float = 0.0,
+        verification_time_sec: float = 0.0,
+    ) -> tuple[bool, list[DSliceQueuedProofRequest]]:
+        loop = asyncio.get_running_loop()
+        is_complete, next_req = await loop.run_in_executor(
+            self._runner_executor,
+            lambda: self.on_incremental_slice_result(
+                run_uid=run_uid,
+                slice_num=slice_num,
+                success=success,
+                computed_outputs=computed_outputs,
+                proof=proof,
+                proof_system=proof_system,
+                response_time_sec=response_time_sec,
+                verification_time_sec=verification_time_sec,
+            ),
+        )
+        return is_complete, [next_req] if next_req else []
+
+    async def apply_tile_result(
+        self,
+        run_uid: str,
+        task_id: str,
+        slice_id: str,
+        tile_idx: int,
+        success: bool,
+        computed_outputs: dict | None = None,
+        proof: str | None = None,
+        witness: str | None = None,
+        proof_system: ProofSystem | None = None,
+        response_time_sec: float = 0.0,
+        verification_time_sec: float = 0.0,
+    ) -> tuple[bool, list[DSliceQueuedProofRequest]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._runner_executor,
+            lambda: self.on_incremental_tile_result(
+                run_uid=run_uid,
+                task_id=task_id,
+                slice_id=slice_id,
+                tile_idx=tile_idx,
+                success=success,
+                computed_outputs=computed_outputs,
+                proof=proof,
+                witness=witness,
+                proof_system=proof_system,
+                response_time_sec=response_time_sec,
+                verification_time_sec=verification_time_sec,
+            ),
+        )
+
+    def mark_slice_failed(self, run_uid: str, slice_num: str) -> None:
+        try:
+            fut = self._runner_executor.submit(
+                self._mark_slice_failed_impl, run_uid, slice_num
+            )
+        except RuntimeError:
+            logging.warning(
+                f"mark_slice_failed skipped (executor shut down) "
+                f"run={run_uid} slice={slice_num}"
+            )
+            return
+
+        def _on_done(f):
+            exc = f.exception()
+            if exc:
+                logging.error(
+                    f"mark_slice_failed error run={run_uid} slice={slice_num}: {exc}"
+                )
+
+        fut.add_done_callback(_on_done)
+
+    def _mark_slice_failed_impl(self, run_uid: str, slice_num: str) -> None:
+        is_tile = "_tile_" in slice_num
+        if is_tile:
+            parts = slice_num.split("_tile_")
+            base_slice, tile_idx = parts[0], int(parts[1])
+            slice_id = f"slice_{base_slice}"
+            is_complete, next_requests = self.on_incremental_tile_result(
+                run_uid=run_uid,
+                task_id=f"{slice_id}_tile_{tile_idx}",
+                slice_id=slice_id,
+                tile_idx=tile_idx,
+                success=False,
+            )
+        else:
+            is_complete, next_req = self.on_incremental_slice_result(
+                run_uid=run_uid,
+                slice_num=slice_num,
+                success=False,
+            )
+            next_requests = [next_req] if next_req else []
+        if next_requests and not is_complete:
+            if self.enqueue_fn and self._loop:
+                for req in next_requests:
+                    self._loop.call_soon_threadsafe(self.enqueue_fn, req)
+            else:
+                logging.warning(
+                    f"Dropping {len(next_requests)} next_requests for "
+                    f"run={run_uid} slice={slice_num}: "
+                    f"enqueue_fn={'set' if self.enqueue_fn else 'None'} "
+                    f"loop={'set' if self._loop else 'None'}"
+                )
+
+    async def generate_requests_async(self) -> list[DSliceQueuedProofRequest]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._runner_executor, self.generate_dslice_requests
+        )
+
+    def get_health_snapshot(self) -> tuple[int, int]:
+        with self._run_timings_lock:
+            timing_entries = sum(len(t.slices) for t in self._run_timings.values())
+        tc_keys = sum(
+            len(s.tensor_cache) for s in self._incremental_runner.get_runs_snapshot()
+        )
+        return timing_entries, tc_keys
+
+    def shutdown(self) -> None:
+        self._runner_executor.shutdown(wait=True, cancel_futures=True)
+
     def has_work_in_flight(self) -> bool:
         with self._incremental_runs_lock:
             for run_uid in self._incremental_runs:
@@ -492,6 +630,29 @@ class DSperseManager:
                 self.event_client.emit_jstprove_range_overflow(
                     run_uid=run_uid,
                     slice_num=slice_id,
+                    overflow_info=overflow_info,
+                )
+            )
+
+    def _on_preflight_complete(
+        self,
+        run_uid: str,
+        slice_id: str,
+        preflight_time_sec: float,
+        overflow_detected: bool,
+        overflow_info: dict | None,
+    ) -> None:
+        logging.info(
+            f"Preflight complete for run {run_uid} {slice_id}: "
+            f"{preflight_time_sec:.2f}s, overflow={overflow_detected}"
+        )
+        if self.event_client:
+            self._schedule_async(
+                self.event_client.emit_preflight_complete(
+                    run_uid=run_uid,
+                    slice_num=slice_id,
+                    preflight_time_sec=preflight_time_sec,
+                    overflow_detected=overflow_detected,
                     overflow_info=overflow_info,
                 )
             )
@@ -539,8 +700,7 @@ class DSperseManager:
             active_uids = list(self._incremental_runs)
         aborted = []
         for run_uid in active_uids:
-            state = self._incremental_runner._runs.get(run_uid)
-            if state and not state.aborted and not state.is_complete:
+            if not self._incremental_runner.is_complete(run_uid):
                 self._incremental_runner.abort_run(run_uid)
                 aborted.append(run_uid)
         if aborted:
@@ -590,7 +750,8 @@ class DSperseManager:
             self._incremental_runs.discard(run_uid)
             self._incremental_run_circuits.pop(run_uid, None)
 
-        run_timing = self._run_timings.pop(run_uid, _RunTiming())
+        with self._run_timings_lock:
+            run_timing = self._run_timings.pop(run_uid, _RunTiming())
 
         if status and circuit_id:
             threading.Thread(
@@ -1142,7 +1303,8 @@ class DSperseManager:
     def cleanup_run(self, run_uid: str):
         self._incremental_runner.cleanup_run(run_uid)
         self._completed_run_statuses.pop(run_uid, None)
-        self._run_timings.pop(run_uid, None)
+        with self._run_timings_lock:
+            self._run_timings.pop(run_uid, None)
         with self._incremental_runs_lock:
             self._incremental_runs.discard(run_uid)
             self._incremental_run_circuits.pop(run_uid, None)
@@ -1160,4 +1322,5 @@ class DSperseManager:
             self._incremental_runs.clear()
             self._incremental_run_circuits.clear()
         self._completed_run_statuses.clear()
-        self._run_timings.clear()
+        with self._run_timings_lock:
+            self._run_timings.clear()

@@ -11,6 +11,7 @@ import json
 import random
 import secrets
 import shutil
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -159,11 +160,16 @@ class IncrementalRunner:
         on_run_complete: Optional[Callable[[str, bool], None]] = None,
         on_jstprove_range_fallback: Optional[Callable[[str, str, dict], None]] = None,
         on_tile_onnx_fallback: Optional[Callable[[str, str, str, int], None]] = None,
+        on_preflight_complete: Optional[
+            Callable[[str, str, float, bool, Optional[dict]], None]
+        ] = None,
     ):
         self._runs: dict[str, RunState] = {}
+        self._runs_lock = threading.Lock()
         self._on_run_complete = on_run_complete
         self._on_jstprove_range_fallback = on_jstprove_range_fallback
         self._on_tile_onnx_fallback = on_tile_onnx_fallback
+        self._on_preflight_complete = on_preflight_complete
 
     def _build_from_dslice_zips(
         self, slices_path: Path, dslice_files: list[Path]
@@ -323,7 +329,8 @@ class IncrementalRunner:
                     last_needed[name] = len(execution_order)
         state.tensor_last_needed_at = last_needed
 
-        self._runs[run_uid] = state
+        with self._runs_lock:
+            self._runs[run_uid] = state
         logging.info(
             f"Run {run_uid} initialized with {len(execution_order)} slices, {total_tiles} tiles"
             + (f" (capped at max_tiles={max_tiles})" if max_tiles is not None else "")
@@ -385,7 +392,18 @@ class IncrementalRunner:
             return []
 
         if state.run_source != RunSource.API:
+            preflight_start = time.perf_counter()
             overflow_info = self._preflight_jstprove_range_check(state, slice_id, meta)
+            preflight_time_sec = time.perf_counter() - preflight_start
+            overflow_detected = overflow_info is not None
+            if self._on_preflight_complete:
+                self._on_preflight_complete(
+                    state.run_uid,
+                    slice_id,
+                    preflight_time_sec,
+                    overflow_detected,
+                    overflow_info,
+                )
             if overflow_info:
                 tile_detail = (
                     f" tile {overflow_info['tile_idx']}"
@@ -615,8 +633,13 @@ class IncrementalRunner:
 
     def cleanup_run(self, run_uid: str) -> None:
         """Clean up run state."""
-        if run_uid in self._runs:
-            del self._runs[run_uid]
+        with self._runs_lock:
+            if run_uid in self._runs:
+                del self._runs[run_uid]
+
+    def get_runs_snapshot(self) -> list[RunState]:
+        with self._runs_lock:
+            return list(self._runs.values())
 
     def create_queued_request(self, work_item: WorkItem) -> DSliceQueuedProofRequest:
         """Convert WorkItem to DSliceQueuedProofRequest."""
@@ -660,7 +683,7 @@ class IncrementalRunner:
         if not slice_dir.exists() or not dslice_path.exists():
             return
 
-        for other in list(self._runs.values()):
+        for other in self.get_runs_snapshot():
             if other is state or other.is_complete:
                 continue
             if other.slices_path == state.slices_path:
