@@ -170,6 +170,29 @@ class DsperseEventClient:
             }
         )
 
+    async def emit_preflight_complete(
+        self,
+        run_uid: str,
+        slice_num: str,
+        preflight_time_sec: float,
+        overflow_detected: bool,
+        overflow_info: dict | None = None,
+    ):
+        event: dict = {
+            "event_type": "preflight_complete",
+            "run_uid": run_uid,
+            "slice_num": slice_num,
+            "preflight_time_sec": preflight_time_sec,
+            "overflow_detected": overflow_detected,
+        }
+        if overflow_info:
+            event["overflow_count"] = overflow_info.get("overflow_count")
+            event["total_elements"] = overflow_info.get("total_elements")
+            event["max_abs"] = overflow_info.get("max_abs")
+            event["n_bits_limit"] = overflow_info.get("n_bits")
+            event["fallback"] = "onnx"
+        await self.emit(event)
+
     async def emit_tile_onnx_fallback(
         self,
         run_uid: str,
@@ -198,6 +221,85 @@ class DsperseEventClient:
                 "run_uid": run_uid,
                 "all_successful": all_successful,
                 "total_run_time_sec": total_run_time_sec,
+            }
+        )
+
+    async def emit_slice_transition_started(
+        self,
+        run_uid: str,
+        slice_num: str,
+    ):
+        await self.emit(
+            {
+                "event_type": "slice_transition_started",
+                "run_uid": run_uid,
+                "slice_num": slice_num,
+            }
+        )
+
+    async def emit_work_items_created(
+        self,
+        run_uid: str,
+        slice_num: str,
+        total_tiles: int,
+        response_time_sec: float,
+    ):
+        await self.emit(
+            {
+                "event_type": "work_items_created",
+                "run_uid": run_uid,
+                "slice_num": slice_num,
+                "total_tiles": total_tiles,
+                "response_time_sec": response_time_sec,
+            }
+        )
+
+    async def emit_onnx_slice_completed(
+        self,
+        run_uid: str,
+        slice_num: str,
+        response_time_sec: float,
+        tensor_cache_entries: int | None = None,
+    ):
+        await self.emit(
+            {
+                "event_type": "onnx_slice_completed",
+                "run_uid": run_uid,
+                "slice_num": slice_num,
+                "response_time_sec": response_time_sec,
+                "tensor_cache_entries": tensor_cache_entries,
+            }
+        )
+
+    async def emit_slice_transition_complete(
+        self,
+        run_uid: str,
+        slice_num: str,
+        total_tiles: int,
+        response_time_sec: float,
+    ):
+        await self.emit(
+            {
+                "event_type": "slice_transition_complete",
+                "run_uid": run_uid,
+                "slice_num": slice_num,
+                "total_tiles": total_tiles,
+                "response_time_sec": response_time_sec,
+            }
+        )
+
+    async def emit_runner_executor_duration(
+        self,
+        run_uid: str,
+        slice_num: str,
+        response_time_sec: float,
+    ):
+        await self.emit(
+            {
+                "event_type": "runner_executor_duration",
+                "run_uid": run_uid,
+                "slice_num": slice_num,
+                "response_time_sec": response_time_sec,
             }
         )
 
